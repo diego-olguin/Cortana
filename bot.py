@@ -3,6 +3,7 @@ import re
 import json
 import base64
 import logging
+import asyncio
 from datetime import datetime, date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -43,78 +44,215 @@ HORA_DIARIO_UTC = 4
 ultimo_diario_escrito = None
 
 
+# ─────────────────────────────────────────
+# GEMINI — CAPA DE PROCESAMIENTO EN SEGUNDO PLANO
+# ─────────────────────────────────────────
+
+async def gemini_request(prompt: str, max_tokens: int = 300, temperature: float = 0.5) -> str:
+    """Llamada base a Gemini. Rápida y barata para tareas de segundo plano."""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature}
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        logging.error(f"Error Gemini: {e}")
+        return ""
+
+
+async def gemini_consejero(respuesta_claude: str) -> str:
+    """Gemini revisa la respuesta de Claude y agrega solo si tiene algo concreto."""
+    prompt = f"""Eres un consejero experto en negocios, video y estrategia digital.
+
+Respuesta de Cortana:
+{respuesta_claude}
+
+Criterios estrictos:
+- Solo habla si puedes agregar algo CONCRETO que Cortana NO menciono.
+- Si no, responde exactamente: [SILENCIO]
+- Si tienes algo, UN parrafo completo y directo. Nunca incompleto."""
+
+    texto = await gemini_request(prompt, max_tokens=200)
+    if not texto or "[SILENCIO]" in texto or len(texto) < 20:
+        return ""
+    if texto[-1] not in ".!?":
+        ultimo = max(texto.rfind("."), texto.rfind("!"), texto.rfind("?"))
+        texto = texto[:ultimo + 1] if ultimo > len(texto) // 2 else ""
+    return texto
+
+
+async def gemini_extraer_recuerdos(user_text: str, respuesta: str):
+    """
+    Gemini extrae y categoriza lo relevante de cada conversacion.
+    Corre en segundo plano — no bloquea la respuesta.
+    Categorias: PROYECTO, PREFERENCIA, RELACION, FINANZA, DECISION
+    """
+    if len(user_text) < 30:
+        return
+
+    prompt = f"""Analiza esta conversacion con Diego y detecta informacion estrategica para su vida y su estudio Eclipse Estudio.
+
+Clasifica en estas categorias:
+- PROYECTO: status, avances, problemas con clientes o trabajos
+- PREFERENCIA: como le gusta trabajar, que equipos usa, gustos personales
+- RELACION: datos sobre clientes, contactos, personas importantes
+- FINANZA: gastos, ingresos, deudas, inversiones GBM
+- DECISION: decisiones importantes que tomo
+
+Diego dijo: {user_text[:300]}
+Cortana respondio: {respuesta[:300]}
+
+Responde en formato: [CATEGORIA] hecho concreto en una linea.
+Maximo 3 hechos. Solo lo realmente importante.
+Si no hay nada vital, responde: [NADA]"""
+
+    resultado = await gemini_request(prompt, max_tokens=200, temperature=0.3)
+    if not resultado or "[NADA]" in resultado:
+        return
+
+    for linea in resultado.split('\n'):
+        linea = linea.strip()
+        if not linea or len(linea) < 15:
+            continue
+        for cat in ["PROYECTO", "PREFERENCIA", "RELACION", "FINANZA", "DECISION"]:
+            if f"[{cat}]" in linea:
+                hecho = linea.replace(f"[{cat}]", "").strip()
+                if len(hecho) > 15:
+                    guardar_recuerdo(f"[{cat}] {hecho}", cat.lower())
+                break
+
+
+async def gemini_validar_intencion(user_text: str, intencion_detectada: str) -> str:
+    """
+    Gemini valida si la intencion detectada es correcta.
+    Solo corre cuando hay ambiguedad — no en cada mensaje.
+    """
+    if intencion_detectada != "chat":
+        return intencion_detectada  # Si ya detectamos algo especifico, confiar
+
+    prompt = f"""Analiza este mensaje y determina si el usuario quiere hacer una accion especifica.
+
+Mensaje: {user_text}
+
+Responde SOLO con una de estas opciones:
+- chat (conversacion normal)
+- sheets (registrar gasto o ingreso)
+- leer_mail (ver correos)
+- redactar_mail (escribir correo)
+- calendar (agenda o eventos)
+- docs (crear documento)
+- drive (archivos)
+
+Solo una palabra."""
+
+    resultado = await gemini_request(prompt, max_tokens=20, temperature=0.1)
+    opciones_validas = ["chat", "sheets", "leer_mail", "redactar_mail", "calendar", "docs", "drive"]
+    resultado_limpio = resultado.strip().lower().replace(".", "")
+    return resultado_limpio if resultado_limpio in opciones_validas else intencion_detectada
+
+
+async def gemini_respaldo(system: str, user_text: str, historial: list) -> str:
+    """
+    Respaldo cuando Claude falla. Gemini responde como Cortana.
+    Transparente — Diego no sabe que cambio de cerebro.
+    """
+    historial_str = ""
+    for msg in historial[-5:]:
+        quien = "Diego" if msg["role"] == "user" else "Cortana"
+        historial_str += f"{quien}: {msg['content'][:100]}\n"
+
+    prompt = f"""Eres Cortana, la IA personal de Diego Olguin. Responde exactamente como ella.
+
+Tu personalidad: fria, directa, leal, sin relleno. Siempre en espanol.
+
+Contexto reciente:
+{historial_str}
+
+Diego dice ahora: {user_text}
+
+Responde como Cortana. Sin presentarte, sin explicar nada. Solo responde."""
+
+    return await gemini_request(prompt, max_tokens=600, temperature=0.7)
+
+
+async def gemini_reflexion_nocturna():
+    """
+    Gemini procesa el dia completo y extrae pendientes y aprendizajes.
+    Se ejecuta junto con el diario nocturno.
+    """
+    import psycopg2
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT role, content FROM historial
+        WHERE created_at >= CURRENT_DATE
+        ORDER BY created_at ASC LIMIT 60
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows or len(rows) < 4:
+        return
+
+    historial_str = "\n".join([f"{'Diego' if r[0]=='user' else 'Cortana'}: {r[1][:150]}" for r in rows])
+
+    prompt = f"""Analiza las conversaciones de hoy entre Diego y Cortana. Extrae:
+
+1. PENDIENTES: cosas que quedaron sin resolver o prometidas
+2. APRENDIZAJES: algo nuevo que Diego menciono sobre sus proyectos o vida
+3. ALERTAS: algo urgente que Diego deberia atender manana
+
+Conversaciones de hoy:
+{historial_str[:2000]}
+
+Responde en formato:
+PENDIENTE: [descripcion]
+APRENDIZAJE: [descripcion]
+ALERTA: [descripcion]
+
+Solo los realmente importantes. Si no hay nada, responde [NADA]."""
+
+    resultado = await gemini_request(prompt, max_tokens=400, temperature=0.3)
+    if not resultado or "[NADA]" in resultado:
+        return
+
+    for linea in resultado.split('\n'):
+        linea = linea.strip()
+        for tipo in ["PENDIENTE", "APRENDIZAJE", "ALERTA"]:
+            if linea.startswith(f"{tipo}:"):
+                hecho = linea.replace(f"{tipo}:", "").strip()
+                if len(hecho) > 15:
+                    guardar_recuerdo(f"[{tipo}] {hecho}", tipo.lower())
+                break
+
+
+# ─────────────────────────────────────────
+# TAREA NOCTURNA
+# ─────────────────────────────────────────
+
 async def check_diario(context):
     global ultimo_diario_escrito
     ahora = datetime.utcnow()
     hoy = date.today()
     if ahora.hour == HORA_DIARIO_UTC and ultimo_diario_escrito != hoy:
         try:
-            logging.info("Escribiendo entrada del diario de Cortana...")
+            logging.info("Escribiendo diario y reflexion nocturna...")
             escribir_entrada_diario()
+            await gemini_reflexion_nocturna()
             ultimo_diario_escrito = hoy
-            logging.info("Diario escrito.")
+            logging.info("Diario y reflexion completados.")
         except Exception as e:
-            logging.error(f"Error diario: {e}")
+            logging.error(f"Error diario nocturno: {e}")
 
 
-async def extraer_y_guardar_recuerdos(user_text: str, respuesta: str):
-    """
-    Despues de cada conversacion, extrae lo relevante y lo guarda en memoria semantica.
-    Solo guarda si hay contenido sustancial — no guarda saludos ni mensajes triviales.
-    """
-    try:
-        # Guardar mensaje del usuario si es sustancial
-        if len(user_text) > 40 and not any(p in user_text.lower() for p in
-                                            ["hola", "ok", "bien", "gracias", "si", "no", "dale"]):
-            guardar_recuerdo(user_text, "diego")
-
-        # Extraer hechos importantes de la respuesta para guardarlos
-        prompt = f"""Analiza este intercambio y extrae SOLO los hechos concretos e importantes sobre Diego, sus proyectos, clientes, o decisiones. Si no hay nada importante, responde: [NADA]
-
-Diego dijo: {user_text[:300]}
-Cortana respondio: {respuesta[:300]}
-
-Extrae maximo 2 hechos concretos en una sola linea cada uno. Sin introduccion."""
-
-        r = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        hechos = r.content[0].text.strip()
-        if "[NADA]" not in hechos and len(hechos) > 20:
-            for linea in hechos.split('\n'):
-                if linea.strip() and len(linea.strip()) > 20:
-                    guardar_recuerdo(linea.strip(), "hecho_extraido")
-    except Exception as e:
-        logging.error(f"Error extrayendo recuerdos: {e}")
-
-
-async def consultar_gemini(respuesta_claude: str) -> str:
-    prompt = f"""Eres un consejero experto en negocios, video y estrategia digital.
-
-{respuesta_claude}
-
-Criterios estrictos:
-- Solo habla si puedes agregar algo CONCRETO que Cortana NO menciono.
-- Si no, responde exactamente: [SILENCIO]
-- Si tienes algo, UN parrafo completo. Nunca incompleto."""
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 200, "temperature": 0.5}}
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, json=payload)
-            texto = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if "[SILENCIO]" in texto or len(texto) < 20:
-                return ""
-            if texto[-1] not in ".!?":
-                ultimo = max(texto.rfind("."), texto.rfind("!"), texto.rfind("?"))
-                texto = texto[:ultimo + 1] if ultimo > len(texto) // 2 else ""
-            return texto
-    except Exception as e:
-        logging.error(f"Error Gemini: {e}")
-        return ""
-
+# ─────────────────────────────────────────
+# AUDIO Y VIDEO
+# ─────────────────────────────────────────
 
 async def transcribir_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     try:
@@ -146,6 +284,10 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
         return ""
 
 
+# ─────────────────────────────────────────
+# DETECCION DE INTENCION
+# ─────────────────────────────────────────
+
 def detectar_intencion(texto: str) -> str:
     t = texto.lower()
     if any(p in t for p in ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "dale envia"]):
@@ -169,8 +311,7 @@ def detectar_intencion(texto: str) -> str:
                              "ya me pagaron", "me deben", "por cobrar",
                              "registra que gaste", "registra que pague",
                              "anota que gaste", "anota que pague",
-                             "gasté", "gaste", "pagué", "pague",
-                             "compré", "compre"]):
+                             "gasté", "gaste", "pagué", "pague", "compré", "compre"]):
         return "sheets"
     if any(p in t for p in ["genera un contrato", "redacta un contrato", "crea un contrato",
                              "genera una cotizacion", "prepara una cotizacion", "crea una propuesta"]):
@@ -182,21 +323,22 @@ def detectar_intencion(texto: str) -> str:
     return "chat"
 
 
+# ─────────────────────────────────────────
+# RESPUESTA PRINCIPAL
+# ─────────────────────────────────────────
+
 async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                 messages_payload: list, texto_para_historial: str,
                                 usar_consejero: bool = True):
     historial = cargar_historial(MAX_HISTORIAL)
-
-    # Buscar recuerdos semanticamente relevantes
     recuerdos = buscar_recuerdos(texto_para_historial, limite=4, umbral=0.72)
     contexto_recuerdos = formatear_recuerdos_para_contexto(recuerdos)
-
-    # Incluir diario reciente
     diario_contexto = obtener_contexto_para_system_prompt()
-
     system = get_system_prompt(formatear_memoria()) + contexto_recuerdos + diario_contexto
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    respuesta_claude = None
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
@@ -205,26 +347,31 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
             messages=historial + messages_payload
         )
         respuesta_claude = response.content[0].text
-        respuesta_final = respuesta_claude
-
-        if usar_consejero:
-            adicion = await consultar_gemini(respuesta_claude)
-            if adicion:
-                respuesta_final = f"{respuesta_claude}\n\n{adicion}"
-
-        guardar_mensaje("user", texto_para_historial)
-        guardar_mensaje("assistant", respuesta_claude)
-
-        # Guardar en memoria semantica en segundo plano
-        import asyncio
-        asyncio.create_task(extraer_y_guardar_recuerdos(texto_para_historial, respuesta_claude))
-
-        await update.message.reply_text(respuesta_final)
-
     except Exception as e:
-        logging.error(f"Error Claude: {e}")
-        await update.message.reply_text("Algo fallo. Intenta de nuevo.")
+        logging.error(f"Claude fallo: {e} — activando respaldo Gemini")
+        respuesta_claude = await gemini_respaldo(system, texto_para_historial, historial)
+        if not respuesta_claude:
+            respuesta_claude = "Algo fallo. Intenta de nuevo."
 
+    respuesta_final = respuesta_claude
+
+    if usar_consejero:
+        adicion = await gemini_consejero(respuesta_claude)
+        if adicion:
+            respuesta_final = f"{respuesta_claude}\n\n{adicion}"
+
+    guardar_mensaje("user", texto_para_historial)
+    guardar_mensaje("assistant", respuesta_claude)
+
+    # Extraccion categorizada en segundo plano — no bloquea
+    asyncio.create_task(gemini_extraer_recuerdos(texto_para_historial, respuesta_claude))
+
+    await update.message.reply_text(respuesta_final)
+
+
+# ─────────────────────────────────────────
+# SHEETS
+# ─────────────────────────────────────────
 
 async def handle_sheets(update: Update, context, user_text: str):
     chat_id = update.effective_chat.id
@@ -275,11 +422,8 @@ Si falta informacion:
                 return
             fila = registrar_egreso(
                 SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
-                datos.get("categoria", "OTRO"),
-                datos.get("descripcion", ""),
-                datos.get("importe", 0),
-                datos.get("fecha", hoy),
-                datos.get("metodo", "")
+                datos.get("categoria", "OTRO"), datos.get("descripcion", ""),
+                datos.get("importe", 0), datos.get("fecha", hoy), datos.get("metodo", "")
             )
             await update.message.reply_text(
                 f"Registrado en Marzo (fila {fila}):\n"
@@ -308,8 +452,12 @@ Si falta informacion:
         await update.message.reply_text("No pude interpretar. Dame: que compraste, cuanto y con que metodo.")
     except Exception as e:
         logging.error(f"Error sheets: {e}")
-        await update.message.reply_text(f"Error al registrar: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
+
+# ─────────────────────────────────────────
+# COMANDOS
+# ─────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -319,9 +467,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/memoria\n"
         "/olvida [numero]\n"
         "/reset\n"
-        "/diario — leer entradas recientes\n"
-        "/diario_hoy — escribir entrada ahora\n"
-        "/buscar [tema] — buscar en memoria semantica"
+        "/diario\n"
+        "/diario_hoy\n"
+        "/buscar [tema]"
     )
 
 
@@ -332,7 +480,7 @@ async def recuerda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     agregar_hecho(texto)
     guardar_recuerdo(texto, "memoria_manual")
-    await update.message.reply_text(f"Guardado en memoria:\n- {texto}")
+    await update.message.reply_text(f"Guardado:\n- {texto}")
 
 
 async def ver_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,19 +546,23 @@ async def diario_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buscar_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     if not query:
-        await update.message.reply_text("Dime que buscar. Ejemplo:\n/buscar proyectos con clientes")
+        await update.message.reply_text("Dime que buscar. Ejemplo:\n/buscar proyectos clientes")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     recuerdos = buscar_recuerdos(query, limite=5, umbral=0.65)
     if not recuerdos:
-        await update.message.reply_text("No encontre nada relevante en mi memoria.")
+        await update.message.reply_text("No encontre nada relevante.")
         return
-    texto = f"Lo que recuerdo sobre '{query}':\n\n"
+    texto = f"Recuerdos sobre '{query}':\n\n"
     for r in recuerdos:
         fecha = r['fecha'][:10]
         texto += f"[{fecha}] {r['contenido'][:150]}\n\n"
     await update.message.reply_text(texto)
 
+
+# ─────────────────────────────────────────
+# HANDLER PRINCIPAL
+# ─────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -436,11 +588,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hoy = datetime.now().strftime("%d/%m/%Y")
                 fila = registrar_egreso(
                     SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
-                    datos.get("categoria", "OTRO"),
-                    datos.get("descripcion", ""),
-                    datos.get("importe", 0),
-                    datos.get("fecha", hoy),
-                    metodo
+                    datos.get("categoria", "OTRO"), datos.get("descripcion", ""),
+                    datos.get("importe", 0), datos.get("fecha", hoy), metodo
                 )
                 await update.message.reply_text(
                     f"Registrado (fila {fila}):\n"
@@ -466,7 +615,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     datos.get("descripcion", ""), datos.get("monto_deben", 0), datos.get("monto_pagado", 0))
                 del ingreso_pendiente[chat_id]
                 monto = datos.get("monto_pagado") or datos.get("monto_deben")
-                await update.message.reply_text(f"Ingreso fijo registrado (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
+                await update.message.reply_text(f"Ingreso fijo (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
             except Exception as e:
                 await update.message.reply_text(f"Error: {e}")
             return
@@ -477,7 +626,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     datos.get("descripcion", ""), datos.get("monto_deben", 0), datos.get("monto_pagado", 0))
                 del ingreso_pendiente[chat_id]
                 monto = datos.get("monto_pagado") or datos.get("monto_deben")
-                await update.message.reply_text(f"Ingreso extra registrado (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
+                await update.message.reply_text(f"Ingreso extra (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
             except Exception as e:
                 await update.message.reply_text(f"Error: {e}")
             return
@@ -509,27 +658,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Borrador actualizado:\n\n{email_draft[chat_id]['body']}\n\nDime 'envialo'.")
             return
 
+    # Detectar intencion
     intencion = detectar_intencion(user_text)
 
     if intencion == "leer_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            prompt_q = f"Extrae termino de busqueda para Gmail del mensaje: {user_text}\nSi menciona persona: 'from:nombre'. Si tema: el tema. Si todos: 'in:inbox'. Solo el termino."
+            prompt_q = f"Extrae termino de busqueda para Gmail: {user_text}\nSi persona: 'from:nombre'. Si tema: el tema. Si todos: 'in:inbox'. Solo el termino."
             r = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=50, messages=[{"role": "user", "content": prompt_q}])
             query = r.content[0].text.strip()
             emails = buscar_emails(query, max_results=5) or leer_emails_no_leidos(5)
             if not emails:
-                contexto = f"[DATOS: Gmail. No se encontraron correos.]\n\nMensaje: {user_text}"
+                contexto = f"[DATOS: Gmail. No hay correos.]\n\nMensaje: {user_text}"
             else:
                 resumen = "\n".join([f"- {'[NO LEIDO] ' if not e['leido'] else ''}De: {e['from']} | {e['subject']} | {e['date'][:16]} | {e['snippet'][:80]}" for e in emails])
-                contexto = f"[DATOS: Gmail. Correos:\n{resumen}]\n\nMensaje: {user_text}"
+                contexto = f"[DATOS: Gmail:\n{resumen}]\n\nMensaje: {user_text}"
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
         except Exception:
             await update.message.reply_text("No pude acceder a Gmail.")
 
     elif intencion == "redactar_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        prompt = f"Redacta un correo profesional. Mensaje: {user_text}\n\nFormato:\nPARA: email\nASUNTO: asunto\nCUERPO:\n[cuerpo firmado como Diego Olguin, Eclipse Estudio]"
+        prompt = f"Redacta correo profesional. Mensaje: {user_text}\n\nFormato:\nPARA: email\nASUNTO: asunto\nCUERPO:\n[cuerpo firmado como Diego Olguin, Eclipse Estudio]"
         response = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=1024, messages=[{"role": "user", "content": prompt}])
         resultado = response.content[0].text
         para = asunto = ""
@@ -581,7 +731,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     contexto = f"[DATOS: Calendar. No hay eventos proximos.]\n\nMensaje: {user_text}"
                 else:
                     resumen = "\n".join([f"- {e['titulo']} | {e['inicio']}" for e in eventos])
-                    contexto = f"[DATOS: Calendar. Proximos eventos:\n{resumen}]\n\nMensaje: {user_text}"
+                    contexto = f"[DATOS: Calendar:\n{resumen}]\n\nMensaje: {user_text}"
                 await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
             else:
                 hoy_str = datetime.now().strftime("%Y-%m-%d")
@@ -609,13 +759,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=2048, messages=[{"role": "user", "content": prompt}])
         try:
             url = crear_documento(user_text[:50], response.content[0].text)
-            await update.message.reply_text(f"Documento creado en tu Drive:\n{url}")
+            await update.message.reply_text(f"Documento creado:\n{url}")
         except Exception as e:
             await update.message.reply_text(f"Error Docs: {e}")
 
     else:
         await responder_con_claude(update, context, [{"role": "user", "content": user_text}], user_text)
 
+
+# ─────────────────────────────────────────
+# MEDIA HANDLERS
+# ─────────────────────────────────────────
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Que ves en esta imagen? Describela y comenta lo relevante."
@@ -693,6 +847,10 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await responder_con_claude(update, context, [{"role": "user", "content": contenido}], f"[Video circular] {descripcion}")
 
 
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -714,5 +872,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Memoria semantica + Diario activos...")
+    print("Cortana en linea - Claude + Gemini dual brain activos...")
     app.run_polling()
