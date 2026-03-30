@@ -3,7 +3,7 @@ import re
 import json
 import base64
 import logging
-from datetime import datetime
+from datetime import datetime, date, time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -11,9 +11,10 @@ import httpx
 from system_prompt import get_system_prompt
 from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje, guardar_config, leer_config
 from gmail import leer_emails_no_leidos, buscar_emails, enviar_email, compartir_drive, listar_drive
-from sheets import registrar_egreso, registrar_ingreso_extra, registrar_ingreso_fijo, leer_sheet, explorar_sheet, CATEGORIAS_VALIDAS
-from docs import crear_documento, listar_documentos
+from sheets import registrar_egreso, registrar_ingreso_extra, registrar_ingreso_fijo, leer_sheet, CATEGORIAS_VALIDAS
+from docs import crear_documento
 from calendar_module import crear_evento, listar_eventos
+from diario import escribir_entrada_diario, leer_entradas_recientes, obtener_contexto_para_system_prompt
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -34,6 +35,28 @@ ingreso_pendiente = {}
 
 SHEET_FINANZAS_ID = "1vNs6j2ZaYuwIKw2DVrBa1n3CVKLDuIwEtQJU9BTWpf0"
 SHEET_FINANZAS_PESTANA = "Marzo"
+
+# Hora en que Cortana escribe su diario (hora UTC — 11pm CDMX = 4am UTC)
+HORA_DIARIO_UTC = 4
+ultimo_diario_escrito = None
+
+
+async def check_diario(context):
+    """
+    Tarea programada — escribe el diario si es la hora correcta y no se ha escrito hoy.
+    """
+    global ultimo_diario_escrito
+    ahora = datetime.utcnow()
+    hoy = date.today()
+
+    if ahora.hour == HORA_DIARIO_UTC and ultimo_diario_escrito != hoy:
+        try:
+            logging.info("Escribiendo entrada del diario de Cortana...")
+            escribir_entrada_diario()
+            ultimo_diario_escrito = hoy
+            logging.info("Diario escrito correctamente.")
+        except Exception as e:
+            logging.error(f"Error escribiendo diario: {e}")
 
 
 async def consultar_gemini(respuesta_claude: str) -> str:
@@ -95,34 +118,21 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
 
 
 def detectar_intencion(texto: str) -> str:
-    """
-    Detecta intencion del mensaje. Solo activa herramientas cuando hay señales claras
-    y explicitas — no por palabras genericas del dia a dia.
-    """
     t = texto.lower()
 
-    # Email — enviar borrador activo
     if any(p in t for p in ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "dale envia"]):
         return "enviar_mail"
-
-    # Email — redactar
     if any(p in t for p in ["redacta un correo", "escribe un correo", "prepara un mail",
                              "manda un correo", "envia un correo", "correo para", "mail para",
                              "email para", "escribele un correo"]):
         return "redactar_mail"
-
-    # Email — leer/buscar
     if any(p in t for p in ["revisa mi correo", "tengo correos", "correos no leidos",
                              "que correos tengo", "hay correos", "busca un correo",
                              "me escribio", "me mando un mail", "me llego un correo"]):
         return "leer_mail"
-
-    # Drive
-    if any(p in t for p in ["comparte la carpeta", "compartir carpeta", "dar acceso a la carpeta",
-                             "comparte el archivo", "mis archivos de drive", "mis carpetas de drive"]):
+    if any(p in t for p in ["comparte la carpeta", "compartir carpeta", "dar acceso",
+                             "comparte el archivo", "mis archivos de drive"]):
         return "drive"
-
-    # Sheets — SOLO cuando explicitamente menciona registrar algo financiero
     if any(p in t for p in ["registra en mi hoja", "agrega a mi hoja", "anota en mi hoja",
                              "registra en sheets", "agrega en sheets", "guarda en sheets",
                              "registra el gasto", "agrega el gasto", "anota el gasto",
@@ -130,21 +140,17 @@ def detectar_intencion(texto: str) -> str:
                              "registra en finanzas", "agrega a finanzas",
                              "ya me pagaron", "me deben", "por cobrar",
                              "registra que gaste", "registra que pague",
-                             "anota que gaste", "anota que pague"]):
+                             "anota que gaste", "anota que pague",
+                             "gasté", "gaste", "pagué", "pague",
+                             "compré", "compre"]):
         return "sheets"
-
-    # Docs
     if any(p in t for p in ["genera un contrato", "redacta un contrato", "crea un contrato",
-                             "genera una cotizacion", "prepara una cotizacion", "crea una propuesta",
-                             "redacta una carta", "genera un documento"]):
+                             "genera una cotizacion", "prepara una cotizacion", "crea una propuesta"]):
         return "docs"
-
-    # Calendar
     if any(p in t for p in ["que tengo en mi agenda", "que hay en mi calendario",
                              "proximos eventos", "crea un evento", "agenda una reunion",
                              "programa una cita", "agregar al calendario", "nuevo evento"]):
         return "calendar"
-
     return "chat"
 
 
@@ -152,7 +158,11 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
                                 messages_payload: list, texto_para_historial: str,
                                 usar_consejero: bool = True):
     historial = cargar_historial(MAX_HISTORIAL)
-    system = get_system_prompt(formatear_memoria())
+
+    # Incluir contexto del diario en el system prompt
+    diario_contexto = obtener_contexto_para_system_prompt()
+    system = get_system_prompt(formatear_memoria()) + diario_contexto
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         response = claude.messages.create(
@@ -182,7 +192,7 @@ async def handle_sheets(update: Update, context, user_text: str):
     hoy = datetime.now().strftime("%d/%m/%Y")
     categorias_str = ", ".join(CATEGORIAS_VALIDAS)
 
-    prompt = f"""Eres un asistente financiero. El usuario quiere registrar un movimiento.
+    prompt = f"""Eres un asistente financiero. El usuario menciono un movimiento de dinero.
 
 FECHA HOY: {hoy}
 CATEGORIAS VALIDAS PARA EGRESOS: {categorias_str}
@@ -191,14 +201,17 @@ MENSAJE: {user_text}
 
 Devuelve SOLO un JSON valido sin texto adicional ni backticks:
 
-Si es GASTO:
-{{"tipo_flujo": "egreso", "datos": {{"categoria": "categoria valida", "descripcion": "descripcion", "importe": 160.00, "fecha": "{hoy}", "metodo": "Efectivo"}}}}
+Si es GASTO (pago, compra, gasto):
+{{"tipo_flujo": "egreso", "datos": {{"categoria": "categoria valida", "descripcion": "lugar o concepto", "importe": 160.00, "fecha": "{hoy}", "metodo": "Efectivo"}}}}
 
 Si es INGRESO:
 {{"tipo_flujo": "ingreso", "datos": {{"descripcion": "cliente o concepto", "monto_deben": 0, "monto_pagado": 5000.00, "fecha": "{hoy}"}}}}
 
-Si es CONSULTA:
-{{"tipo_flujo": "consulta", "pregunta": "que quiere saber"}}"""
+Si es CONSULTA de saldos:
+{{"tipo_flujo": "consulta", "pregunta": "que quiere saber"}}
+
+Si NO hay suficiente informacion para registrar:
+{{"tipo_flujo": "falta_info", "mensaje": "que falta"}}"""
 
     try:
         response = claude.messages.create(
@@ -212,6 +225,15 @@ Si es CONSULTA:
         datos = resultado.get("datos", {})
 
         if tipo == "egreso":
+            # Si falta el metodo de pago, preguntar
+            if not datos.get("metodo") or datos.get("metodo") == "":
+                guardar_config("egreso_pendiente", json.dumps(datos))
+                await update.message.reply_text(
+                    f"Detecto: {datos.get('categoria')} | {datos.get('descripcion')} | ${datos.get('importe')}\n\n"
+                    "Como pagaste? Efectivo, BBVA, Santander, Nu?"
+                )
+                return
+
             fila = registrar_egreso(
                 SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
                 datos.get("categoria", "OTRO"),
@@ -221,9 +243,9 @@ Si es CONSULTA:
                 datos.get("metodo", "")
             )
             await update.message.reply_text(
-                f"Gasto registrado (fila {fila}):\n"
+                f"Registrado en Marzo (fila {fila}):\n"
                 f"{datos.get('categoria')} | {datos.get('descripcion')} | "
-                f"${datos.get('importe')} | {datos.get('fecha')} | {datos.get('metodo')}"
+                f"${datos.get('importe')} | {datos.get('metodo')}"
             )
 
         elif tipo == "ingreso":
@@ -232,7 +254,7 @@ Si es CONSULTA:
             estado = "por cobrar" if datos.get("monto_deben") else "ya cobrado"
             await update.message.reply_text(
                 f"Ingreso: {datos.get('descripcion')} | ${monto} | {estado}\n\n"
-                "Es ingreso FIJO (cliente recurrente) o EXTRA (proyecto freelance)?"
+                "Es FIJO (cliente recurrente) o EXTRA (proyecto freelance)?"
             )
 
         elif tipo == "consulta":
@@ -241,10 +263,10 @@ Si es CONSULTA:
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
 
         else:
-            await update.message.reply_text("No entendi si es gasto o ingreso. Dame mas detalle.")
+            await update.message.reply_text("No entendi bien. Dame: que fue, cuanto y como pagaste.")
 
     except json.JSONDecodeError:
-        await update.message.reply_text("No pude interpretar el movimiento. Dame: que fue, cuanto y si pagaste o te pagaron.")
+        await update.message.reply_text("No pude interpretar. Dame: que compraste/pagaste, cuanto y con que metodo.")
     except Exception as e:
         logging.error(f"Error sheets: {e}")
         await update.message.reply_text(f"Error al registrar: {e}")
@@ -258,7 +280,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/recuerda [hecho]\n"
         "/memoria\n"
         "/olvida [numero]\n"
-        "/reset"
+        "/reset\n"
+        "/diario — leer mis entradas recientes\n"
+        "/diario_hoy — escribir entrada de hoy ahora"
     )
 
 
@@ -310,17 +334,80 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Conversacion reiniciada. Memoria permanente intacta.")
 
 
+async def ver_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    entradas = leer_entradas_recientes(3)
+    if not entradas:
+        await update.message.reply_text("No hay entradas en el diario todavia. Usa /diario_hoy para escribir la primera.")
+        return
+    texto = ""
+    for e in reversed(entradas):
+        texto += f"— {e['fecha']} —\n{e['entrada']}\n\n"
+    await update.message.reply_text(texto)
+
+
+async def diario_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Escribiendo entrada del diario...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        entrada = escribir_entrada_diario()
+        await update.message.reply_text(f"— {date.today()} —\n\n{entrada}")
+    except Exception as e:
+        await update.message.reply_text(f"Error al escribir el diario: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
     texto_lower = user_text.lower().strip()
 
-    # Flujo de confirmacion de tipo de ingreso
+    # Flujo de metodo de pago pendiente
+    egreso_raw = leer_config("egreso_pendiente")
+    if egreso_raw:
+        try:
+            datos = json.loads(egreso_raw)
+            # Detectar metodo de pago en la respuesta
+            metodo = ""
+            if any(p in texto_lower for p in ["efectivo", "cash"]):
+                metodo = "Efectivo"
+            elif any(p in texto_lower for p in ["bbva", "banamex"]):
+                metodo = "BBVA"
+            elif any(p in texto_lower for p in ["santander"]):
+                metodo = "Santander"
+            elif any(p in texto_lower for p in ["nu", "nubank"]):
+                metodo = "Nu"
+            elif any(p in texto_lower for p in ["tarjeta", "credito", "debito"]):
+                metodo = "Tarjeta"
+            elif any(p in texto_lower for p in ["transferencia", "spei"]):
+                metodo = "Transferencia"
+
+            if metodo:
+                datos["metodo"] = metodo
+                guardar_config("egreso_pendiente", "")
+                hoy = datetime.now().strftime("%d/%m/%Y")
+                fila = registrar_egreso(
+                    SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
+                    datos.get("categoria", "OTRO"),
+                    datos.get("descripcion", ""),
+                    datos.get("importe", 0),
+                    datos.get("fecha", hoy),
+                    metodo
+                )
+                await update.message.reply_text(
+                    f"Registrado (fila {fila}):\n"
+                    f"{datos.get('categoria')} | {datos.get('descripcion')} | "
+                    f"${datos.get('importe')} | {metodo}"
+                )
+                return
+            else:
+                guardar_config("egreso_pendiente", "")
+        except Exception:
+            guardar_config("egreso_pendiente", "")
+
+    # Flujo de tipo de ingreso
     if chat_id in ingreso_pendiente:
-        # Cancelar si el usuario dice que no
-        if any(p in texto_lower for p in ["no", "cancel", "olvida", "nada", "dejalo", "no quiero", "no importa"]):
+        if any(p in texto_lower for p in ["no", "cancel", "olvida", "nada", "dejalo"]):
             del ingreso_pendiente[chat_id]
-            await update.message.reply_text("Ok, ingreso cancelado.")
+            await update.message.reply_text("Ok, cancelado.")
             return
         elif "fijo" in texto_lower:
             try:
@@ -353,10 +440,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Error: {e}")
             return
         else:
-            # Si responde otra cosa, cancelar el estado y procesar normal
             del ingreso_pendiente[chat_id]
 
-    # Flujo de borrador de email
+    # Flujo de email
     if chat_id in email_draft:
         intencion = detectar_intencion(user_text)
         if intencion == "enviar_mail":
@@ -368,7 +454,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await update.message.reply_text(f"Error al enviar: {e}")
             return
-        elif any(p in texto_lower for p in ["no", "cancel", "olvida", "no lo mandes"]):
+        elif any(p in texto_lower for p in ["no", "cancel", "olvida"]):
             del email_draft[chat_id]
             await update.message.reply_text("Borrador cancelado.")
             return
@@ -396,7 +482,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resumen = "\n".join([f"- {'[NO LEIDO] ' if not e['leido'] else ''}De: {e['from']} | {e['subject']} | {e['date'][:16]} | {e['snippet'][:80]}" for e in emails])
                 contexto = f"[DATOS: Gmail. Correos:\n{resumen}]\n\nMensaje: {user_text}"
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
-        except Exception as e:
+        except Exception:
             await update.message.reply_text("No pude acceder a Gmail.")
 
     elif intencion == "redactar_mail":
@@ -437,16 +523,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     elif linea.startswith("ROL:"): rol = linea.replace("ROL:", "").strip().lower()
                 encontrado = next((a for a in archivos if nombre.lower() in a['name'].lower()), None)
                 if encontrado and email_dest:
+                    from gmail import compartir_drive
                     url = compartir_drive(encontrado['id'], email_dest, rol)
                     await update.message.reply_text(f"'{encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}")
                 else:
                     lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
                     await update.message.reply_text(f"No encontre '{nombre}'. Archivos:\n{lista}")
-            else:
-                archivos = listar_drive(max_results=10)
-                lista = "\n".join([f"- {a['name']}" for a in archivos])
-                contexto = f"[DATOS: Drive. Archivos:\n{lista}]\n\nMensaje: {user_text}"
-                await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
         except Exception as e:
             await update.message.reply_text(f"Error Drive: {e}")
 
@@ -462,8 +544,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     contexto = f"[DATOS: Calendar. Proximos eventos:\n{resumen}]\n\nMensaje: {user_text}"
                 await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
             else:
-                hoy = datetime.now().strftime("%Y-%m-%d")
-                prompt = f"Crear evento. Mensaje: {user_text}\nHoy: {hoy}\n\nFormato:\nTITULO:\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION:\nINVITADOS: email1,email2\nRECORDATORIO: 30"
+                hoy_str = datetime.now().strftime("%Y-%m-%d")
+                prompt = f"Crear evento. Mensaje: {user_text}\nHoy: {hoy_str}\n\nFormato:\nTITULO:\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION:\nINVITADOS: email1,email2\nRECORDATORIO: 30"
                 response = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=300, messages=[{"role": "user", "content": prompt}])
                 datos = {}
                 for linea in response.content[0].text.split('\n'):
@@ -477,7 +559,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     resp += f"\n\n{url}"
                     await update.message.reply_text(resp)
                 else:
-                    await update.message.reply_text("Dame titulo, fecha y hora de inicio y fin.")
+                    await update.message.reply_text("Dame titulo, fecha y hora.")
         except Exception as e:
             await update.message.reply_text(f"Error Calendar: {e}")
 
@@ -572,13 +654,19 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
+    from telegram.ext import JobQueue
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Tarea nocturna del diario — cada hora revisa si es momento de escribir
+    app.job_queue.run_repeating(check_diario, interval=3600, first=10)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("recuerda", recuerda))
     app.add_handler(CommandHandler("memoria", ver_memoria))
     app.add_handler(CommandHandler("olvida", olvida))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("diario", ver_diario))
+    app.add_handler(CommandHandler("diario_hoy", diario_hoy))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -587,5 +675,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea...")
+    print("Cortana en linea - Diario activo...")
     app.run_polling()
