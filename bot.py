@@ -1,6 +1,7 @@
 import os
 import base64
 import logging
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -10,6 +11,7 @@ from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_m
 from gmail import leer_emails_no_leidos, enviar_email
 from sheets import leer_sheet, escribir_sheet
 from docs import crear_documento, listar_documentos
+from calendar_module import crear_evento, listar_eventos
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -92,7 +94,8 @@ def detectar_intencion(texto: str) -> str:
     texto_lower = texto.lower()
 
     palabras_mail = ["correo", "mail", "email", "mensaje", "inbox", "bandeja", "escribio", "mando un mail",
-                     "mando correo", "recibiste", "tiene correo", "tengo correo", "no leidos", "sin leer"]
+                     "mando correo", "recibiste", "tiene correo", "tengo correo", "no leidos", "sin leer",
+                     "revisa mi correo", "hay correos", "correos nuevos"]
     palabras_redactar = ["redacta", "escribe un correo", "prepara un mail", "manda un correo",
                          "envia un correo", "correo para", "mail para", "email para"]
     palabras_enviar = ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "manda el correo"]
@@ -100,6 +103,9 @@ def detectar_intencion(texto: str) -> str:
                       "guarda en sheets", "anota en la tabla", "actualiza la hoja"]
     palabras_doc = ["documento", "contrato", "cotizacion", "doc", "crea un documento", "genera un contrato",
                     "redacta un contrato", "prepara la cotizacion"]
+    palabras_calendar = ["calendario", "agenda", "evento", "cita", "reunion", "agendar", "programa",
+                         "recordatorio", "que tengo", "que hay", "proximos eventos", "esta semana",
+                         "invita", "invitar", "crear evento", "nuevo evento"]
 
     if any(p in texto_lower for p in palabras_enviar):
         return "enviar_mail"
@@ -111,6 +117,8 @@ def detectar_intencion(texto: str) -> str:
         return "sheets"
     if any(p in texto_lower for p in palabras_doc):
         return "docs"
+    if any(p in texto_lower for p in palabras_calendar):
+        return "calendar"
     return "chat"
 
 
@@ -150,9 +158,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Cortana en linea.\n\n"
         "Puedes hablarme naturalmente sobre:\n"
-        "- Tus correos (leer, redactar, enviar)\n"
-        "- Google Sheets (registrar, actualizar datos)\n"
-        "- Google Docs (crear contratos, cotizaciones)\n\n"
+        "- Correos (leer, redactar, enviar)\n"
+        "- Calendario (ver eventos, crear, invitar)\n"
+        "- Google Sheets\n"
+        "- Google Docs\n\n"
         "Comandos:\n"
         "/recuerda [hecho]\n"
         "/memoria\n"
@@ -211,7 +220,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
 
-    # Si hay borrador activo, permite modificarlo o enviarlo
     if chat_id in email_draft:
         intencion = detectar_intencion(user_text)
         if intencion == "enviar_mail":
@@ -247,25 +255,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             emails = leer_emails_no_leidos(5)
             if not emails:
-                contexto = "El usuario pregunto por sus correos. No hay correos no leidos en este momento."
+                contexto = "El usuario pregunto por sus correos. No hay correos no leidos."
             else:
                 resumen = "\n".join([f"- De: {e['from']} | Asunto: {e['subject']} | {e['snippet'][:80]}" for e in emails])
-                contexto = f"El usuario pregunto por sus correos. Estos son los correos no leidos:\n{resumen}\n\nResponde de forma natural sobre estos correos."
+                contexto = f"El usuario pregunto por sus correos. Correos no leidos:\n{resumen}\n\nResponde de forma natural."
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text)
         except Exception as e:
             logging.error(f"Error Gmail: {e}")
-            await update.message.reply_text("No pude acceder a Gmail en este momento.")
+            await update.message.reply_text("No pude acceder a Gmail.")
 
     elif intencion == "redactar_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        prompt = f"El usuario quiere redactar un correo. Su mensaje: {user_text}\n\nExtrae destinatario, asunto y redacta el cuerpo del correo profesional firmado como Diego Olguin de Eclipse Estudio. Responde en este formato exacto:\nPARA: email@destino.com\nASUNTO: asunto del correo\nCUERPO:\n[cuerpo del correo]"
+        prompt = f"El usuario quiere redactar un correo. Su mensaje: {user_text}\n\nExtrae destinatario, asunto y redacta el cuerpo profesional firmado como Diego Olguin de Eclipse Estudio. Formato exacto:\nPARA: email@destino.com\nASUNTO: asunto\nCUERPO:\n[cuerpo]"
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}]
         )
         resultado = response.content[0].text
-
         lineas = resultado.split('\n')
         para = ""
         asunto = ""
@@ -291,17 +298,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(resultado)
 
+    elif intencion == "calendar":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            # Detectar si quiere ver o crear
+            texto_lower = user_text.lower()
+            if any(p in texto_lower for p in ["que tengo", "que hay", "proximos", "agenda", "esta semana", "ver"]):
+                eventos = listar_eventos(7)
+                if not eventos:
+                    contexto = "El usuario pregunto por su calendario. No hay eventos proximos en los siguientes 7 dias."
+                else:
+                    resumen = "\n".join([f"- {e['titulo']} | {e['inicio']} | Invitados: {', '.join(e['invitados']) if e['invitados'] else 'ninguno'}" for e in eventos])
+                    contexto = f"El usuario pregunto por su calendario. Proximos eventos:\n{resumen}\n\nResponde de forma natural."
+                await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text)
+            else:
+                # Crear evento — Claude extrae los datos
+                hoy = datetime.now().strftime("%Y-%m-%d")
+                prompt = f"El usuario quiere crear un evento en Google Calendar. Su mensaje: {user_text}\n\nHoy es {hoy}. Extrae los datos y responde en este formato exacto:\nTITULO: nombre del evento\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION: descripcion opcional\nINVITADOS: email1@ejemplo.com,email2@ejemplo.com\nRECORDATORIO: 30"
+                response = claude.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=500,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                resultado = response.content[0].text
+                lineas = resultado.split('\n')
+                datos = {}
+                for linea in lineas:
+                    for campo in ["TITULO", "INICIO", "FIN", "DESCRIPCION", "INVITADOS", "RECORDATORIO"]:
+                        if linea.startswith(f"{campo}:"):
+                            datos[campo] = linea.replace(f"{campo}:", "").strip()
+
+                if "TITULO" in datos and "INICIO" in datos and "FIN" in datos:
+                    invitados = [e.strip() for e in datos.get("INVITADOS", "").split(",") if "@" in e]
+                    recordatorio = int(datos.get("RECORDATORIO", "30"))
+                    url = crear_evento(
+                        datos["TITULO"], datos["INICIO"], datos["FIN"],
+                        datos.get("DESCRIPCION", ""), invitados, recordatorio
+                    )
+                    respuesta = f"Evento creado: {datos['TITULO']}\nInicio: {datos['INICIO']}\nFin: {datos['FIN']}"
+                    if invitados:
+                        respuesta += f"\nInvitados: {', '.join(invitados)}"
+                    respuesta += f"\n\nVer en Calendar: {url}"
+                    await update.message.reply_text(respuesta)
+                else:
+                    await update.message.reply_text("No pude extraer los datos del evento. Dame mas detalles: titulo, fecha, hora y a quien invitar.")
+        except Exception as e:
+            logging.error(f"Error Calendar: {e}")
+            await update.message.reply_text(f"Error con Calendar: {e}")
+
     elif intencion == "sheets":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         await responder_con_claude(
             update, context,
-            [{"role": "user", "content": f"{user_text}\n\n[Nota: El usuario quiere trabajar con Google Sheets. Pidele el ID del spreadsheet o el nombre de la hoja si no lo has dado. Explica como puede compartir el link del sheet para que puedas acceder.]"}],
+            [{"role": "user", "content": f"{user_text}\n\n[El usuario quiere trabajar con Google Sheets. Pidele el link del spreadsheet si no lo tienes.]"}],
             user_text
         )
 
     elif intencion == "docs":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        prompt = f"El usuario quiere crear un documento de Google Docs. Su mensaje: {user_text}\n\nGenera el contenido completo del documento (contrato, cotizacion, etc) profesional para Eclipse Estudio de Diego Olguin. Empieza directamente con el contenido del documento."
+        prompt = f"El usuario quiere crear un documento. Su mensaje: {user_text}\n\nGenera el contenido completo del documento profesional para Eclipse Estudio de Diego Olguin."
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2048,
@@ -309,13 +364,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         contenido = response.content[0].text
         titulo = user_text[:50]
-
         try:
             url = crear_documento(titulo, contenido)
             await update.message.reply_text(f"Documento creado:\n{url}\n\nContenido:\n{contenido[:500]}...")
         except Exception as e:
             logging.error(f"Error Docs: {e}")
-            await update.message.reply_text(f"No pude crear el documento. Error: {e}")
+            await update.message.reply_text(f"Error al crear documento: {e}")
 
     else:
         await responder_con_claude(
@@ -428,5 +482,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Gmail, Sheets y Docs activos...")
+    print("Cortana en linea - Gmail, Sheets, Docs y Calendar activos...")
     app.run_polling()
