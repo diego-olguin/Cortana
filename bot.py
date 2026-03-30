@@ -127,32 +127,19 @@ RESPUESTA DE CLAUDE:
 # ─────────────────────────────────────────
 
 async def transcribir_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
-    """
-    Envía audio a Gemini y devuelve la transcripción en texto.
-    Telegram envía voz como audio/ogg con codecs opus.
-    """
     try:
-        audio_b64 = base64.b64encode(audio_bytes).decode()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
-            "contents": [{
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": audio_b64
-                        }
-                    },
-                    {
-                        "text": "Transcribe exactamente lo que se dice en este audio. Devuelve solo la transcripción, sin comentarios."
-                    }
-                ]
-            }],
+            "contents": [{"parts": [
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode()}},
+                {"text": "Transcribe exactamente lo que se dice en este audio. Solo la transcripción, sin comentarios."}
+            ]}],
             "generationConfig": {"maxOutputTokens": 500, "temperature": 0.2}
         }
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(url, json=payload)
-            data = response.json()
+            r = await client.post(url, json=payload)
+            data = r.json()
+            logging.info(f"Gemini audio response: {data}")  # <-- línea nueva
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
         logging.error(f"Error transcribiendo audio: {e}")
