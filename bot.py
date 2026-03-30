@@ -30,13 +30,10 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 init_db()
 
 email_draft = {}
+ingreso_pendiente = {}
 
-# Finanzas sheet fijo
 SHEET_FINANZAS_ID = "1vNs6j2ZaYuwIKw2DVrBa1n3CVKLDuIwEtQJU9BTWpf0"
 SHEET_FINANZAS_PESTANA = "Marzo"
-
-# Estado temporal para ingresos pendientes de confirmar tipo
-ingreso_pendiente = {}
 
 
 async def consultar_gemini(respuesta_claude: str) -> str:
@@ -98,27 +95,56 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
 
 
 def detectar_intencion(texto: str) -> str:
+    """
+    Detecta intencion del mensaje. Solo activa herramientas cuando hay señales claras
+    y explicitas — no por palabras genericas del dia a dia.
+    """
     t = texto.lower()
+
+    # Email — enviar borrador activo
     if any(p in t for p in ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "dale envia"]):
         return "enviar_mail"
-    if any(p in t for p in ["redacta", "escribe un correo", "correo para", "mail para", "email para", "escribele"]):
+
+    # Email — redactar
+    if any(p in t for p in ["redacta un correo", "escribe un correo", "prepara un mail",
+                             "manda un correo", "envia un correo", "correo para", "mail para",
+                             "email para", "escribele un correo"]):
         return "redactar_mail"
-    if any(p in t for p in ["correo", "mail", "email", "inbox", "bandeja", "escribio", "mando correo",
-                             "recibiste", "tengo correo", "no leidos", "me escribio", "me llego algo"]):
+
+    # Email — leer/buscar
+    if any(p in t for p in ["revisa mi correo", "tengo correos", "correos no leidos",
+                             "que correos tengo", "hay correos", "busca un correo",
+                             "me escribio", "me mando un mail", "me llego un correo"]):
         return "leer_mail"
-    if any(p in t for p in ["carpeta", "folder", "comparte", "compartir", "acceso a", "dar acceso", "archivos de drive"]):
+
+    # Drive
+    if any(p in t for p in ["comparte la carpeta", "compartir carpeta", "dar acceso a la carpeta",
+                             "comparte el archivo", "mis archivos de drive", "mis carpetas de drive"]):
         return "drive"
-    if any(p in t for p in ["sheets", "hoja", "registro", "agrega", "registra", "anota",
-                             "gasto", "ingreso", "finanzas", "gastos", "egresos", "ingresos",
-                             "me deben", "ya me pagaron", "por cobrar", "recibi", "pague",
-                             "comida", "uber", "gasolina", "renta", "gym", "cliente", "cobro",
-                             "cuanto llevo", "balance", "resumen"]):
+
+    # Sheets — SOLO cuando explicitamente menciona registrar algo financiero
+    if any(p in t for p in ["registra en mi hoja", "agrega a mi hoja", "anota en mi hoja",
+                             "registra en sheets", "agrega en sheets", "guarda en sheets",
+                             "registra el gasto", "agrega el gasto", "anota el gasto",
+                             "registra el ingreso", "agrega el ingreso",
+                             "registra en finanzas", "agrega a finanzas",
+                             "ya me pagaron", "me deben", "por cobrar",
+                             "registra que gaste", "registra que pague",
+                             "anota que gaste", "anota que pague"]):
         return "sheets"
-    if any(p in t for p in ["documento", "contrato", "genera un contrato", "cotizacion", "carta", "propuesta"]):
+
+    # Docs
+    if any(p in t for p in ["genera un contrato", "redacta un contrato", "crea un contrato",
+                             "genera una cotizacion", "prepara una cotizacion", "crea una propuesta",
+                             "redacta una carta", "genera un documento"]):
         return "docs"
-    if any(p in t for p in ["calendario", "agenda", "evento", "cita", "reunion", "agendar",
-                             "que tengo", "proximos eventos", "esta semana", "invita", "crear evento"]):
+
+    # Calendar
+    if any(p in t for p in ["que tengo en mi agenda", "que hay en mi calendario",
+                             "proximos eventos", "crea un evento", "agenda una reunion",
+                             "programa una cita", "agregar al calendario", "nuevo evento"]):
         return "calendar"
+
     return "chat"
 
 
@@ -156,7 +182,7 @@ async def handle_sheets(update: Update, context, user_text: str):
     hoy = datetime.now().strftime("%d/%m/%Y")
     categorias_str = ", ".join(CATEGORIAS_VALIDAS)
 
-    prompt = f"""Eres un asistente financiero. El usuario quiere registrar un movimiento financiero.
+    prompt = f"""Eres un asistente financiero. El usuario quiere registrar un movimiento.
 
 FECHA HOY: {hoy}
 CATEGORIAS VALIDAS PARA EGRESOS: {categorias_str}
@@ -165,17 +191,14 @@ MENSAJE: {user_text}
 
 Devuelve SOLO un JSON valido sin texto adicional ni backticks:
 
-Si es GASTO/EGRESO:
+Si es GASTO:
 {{"tipo_flujo": "egreso", "datos": {{"categoria": "categoria valida", "descripcion": "descripcion", "importe": 160.00, "fecha": "{hoy}", "metodo": "Efectivo"}}}}
 
-Si es INGRESO (cualquier tipo):
+Si es INGRESO:
 {{"tipo_flujo": "ingreso", "datos": {{"descripcion": "cliente o concepto", "monto_deben": 0, "monto_pagado": 5000.00, "fecha": "{hoy}"}}}}
 
-Si es CONSULTA de saldos o resumen:
-{{"tipo_flujo": "consulta", "pregunta": "que quiere saber"}}
-
-Si NO es claro si es gasto o ingreso:
-{{"tipo_flujo": "ambiguo", "mensaje": "razon de la ambiguedad"}}"""
+Si es CONSULTA:
+{{"tipo_flujo": "consulta", "pregunta": "que quiere saber"}}"""
 
     try:
         response = claude.messages.create(
@@ -204,27 +227,24 @@ Si NO es claro si es gasto o ingreso:
             )
 
         elif tipo == "ingreso":
-            # Guardar datos del ingreso y preguntar si es fijo o extra
             ingreso_pendiente[chat_id] = datos
             monto = datos.get("monto_pagado") or datos.get("monto_deben")
             estado = "por cobrar" if datos.get("monto_deben") else "ya cobrado"
             await update.message.reply_text(
-                f"Ingreso detectado: {datos.get('descripcion')} | ${monto} | {estado}\n\n"
-                "Es ingreso FIJO (cliente recurrente mensual) o EXTRA (trabajo freelance/proyecto)?\n"
-                "Responde: fijo o extra"
+                f"Ingreso: {datos.get('descripcion')} | ${monto} | {estado}\n\n"
+                "Es ingreso FIJO (cliente recurrente) o EXTRA (proyecto freelance)?"
             )
 
         elif tipo == "consulta":
             datos_sheet = leer_sheet(SHEET_FINANZAS_ID, f"{SHEET_FINANZAS_PESTANA}!A3:E30")
-            contexto = f"[DATOS FINANZAS MARZO - primeros registros:\n{datos_sheet}]\n\nPregunta: {user_text}"
+            contexto = f"[DATOS FINANZAS MARZO:\n{datos_sheet}]\n\nPregunta: {user_text}"
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
 
         else:
-            await update.message.reply_text("No entendi si es gasto o ingreso. Dame mas detalle: que fue, cuanto y si pagaste o te pagaron.")
+            await update.message.reply_text("No entendi si es gasto o ingreso. Dame mas detalle.")
 
-    except json.JSONDecodeError as e:
-        logging.error(f"Error JSON sheets: {e}")
-        await update.message.reply_text("No pude interpretar el movimiento. Dame: descripcion, monto y si es gasto o ingreso.")
+    except json.JSONDecodeError:
+        await update.message.reply_text("No pude interpretar el movimiento. Dame: que fue, cuanto y si pagaste o te pagaron.")
     except Exception as e:
         logging.error(f"Error sheets: {e}")
         await update.message.reply_text(f"Error al registrar: {e}")
@@ -285,19 +305,26 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     cur.close()
     conn.close()
+    ingreso_pendiente.clear()
+    email_draft.clear()
     await update.message.reply_text("Conversacion reiniciada. Memoria permanente intacta.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
+    texto_lower = user_text.lower().strip()
 
     # Flujo de confirmacion de tipo de ingreso
     if chat_id in ingreso_pendiente:
-        texto_lower = user_text.lower().strip()
-        datos = ingreso_pendiente[chat_id]
-        if "fijo" in texto_lower:
+        # Cancelar si el usuario dice que no
+        if any(p in texto_lower for p in ["no", "cancel", "olvida", "nada", "dejalo", "no quiero", "no importa"]):
+            del ingreso_pendiente[chat_id]
+            await update.message.reply_text("Ok, ingreso cancelado.")
+            return
+        elif "fijo" in texto_lower:
             try:
+                datos = ingreso_pendiente[chat_id]
                 fila = registrar_ingreso_fijo(
                     SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
                     datos.get("descripcion", ""),
@@ -310,8 +337,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await update.message.reply_text(f"Error: {e}")
             return
-        elif "extra" in texto_lower or "freelance" in texto_lower or "proyecto" in texto_lower:
+        elif any(p in texto_lower for p in ["extra", "freelance", "proyecto", "variable"]):
             try:
+                datos = ingreso_pendiente[chat_id]
                 fila = registrar_ingreso_extra(
                     SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
                     datos.get("descripcion", ""),
@@ -325,8 +353,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Error: {e}")
             return
         else:
-            await update.message.reply_text("Responde 'fijo' o 'extra' para registrar el ingreso.")
-            return
+            # Si responde otra cosa, cancelar el estado y procesar normal
+            del ingreso_pendiente[chat_id]
 
     # Flujo de borrador de email
     if chat_id in email_draft:
@@ -339,6 +367,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Correo enviado a {draft['to']}.")
             except Exception as e:
                 await update.message.reply_text(f"Error al enviar: {e}")
+            return
+        elif any(p in texto_lower for p in ["no", "cancel", "olvida", "no lo mandes"]):
+            del email_draft[chat_id]
+            await update.message.reply_text("Borrador cancelado.")
             return
         else:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -393,7 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif intencion == "drive":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            if any(p in user_text.lower() for p in ["comparte", "compartir", "dar acceso"]):
+            if any(p in texto_lower for p in ["comparte", "compartir", "dar acceso"]):
                 prompt = f"Quiere compartir de Drive. Mensaje: {user_text}\n\nExtrae:\nARCHIVO: nombre\nEMAIL: email\nROL: reader/commenter/writer"
                 r = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=100, messages=[{"role": "user", "content": prompt}])
                 archivos = listar_drive(max_results=20)
@@ -409,7 +441,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"'{encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}")
                 else:
                     lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
-                    await update.message.reply_text(f"No encontre '{nombre}'. Archivos disponibles:\n{lista}")
+                    await update.message.reply_text(f"No encontre '{nombre}'. Archivos:\n{lista}")
             else:
                 archivos = listar_drive(max_results=10)
                 lista = "\n".join([f"- {a['name']}" for a in archivos])
@@ -421,7 +453,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif intencion == "calendar":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            if any(p in user_text.lower() for p in ["que tengo", "que hay", "proximos", "agenda", "semana", "hay algo"]):
+            if any(p in texto_lower for p in ["que tengo", "que hay", "proximos", "agenda", "semana", "hay algo"]):
                 eventos = listar_eventos(7)
                 if not eventos:
                     contexto = f"[DATOS: Calendar. No hay eventos proximos.]\n\nMensaje: {user_text}"
@@ -555,5 +587,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Finanzas precisas activas...")
+    print("Cortana en linea...")
     app.run_polling()
