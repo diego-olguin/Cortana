@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import logging
 from datetime import datetime
 from telegram import Update
@@ -9,7 +10,7 @@ import httpx
 from system_prompt import get_system_prompt
 
 # ─────────────────────────────────────────
-# CONFIG — pon tus keys aquí
+# CONFIG
 # ─────────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
@@ -86,10 +87,6 @@ def guardar_historial(historial):
 # ─────────────────────────────────────────
 
 async def consultar_gemini(pregunta_original: str, respuesta_claude: str) -> str:
-    """
-    Gemini actúa como consejero: revisa la respuesta de Claude
-    y solo habla si tiene algo relevante que agregar o corregir.
-    """
     prompt_consejero = f"""Eres un consejero inteligente. Claude (el cerebro principal) ya respondió una pregunta.
 Tu trabajo es revisar esa respuesta y decidir:
 
@@ -123,6 +120,127 @@ RESPUESTA DE CLAUDE:
     except Exception as e:
         logging.error(f"Error Gemini: {e}")
         return ""
+
+
+# ─────────────────────────────────────────
+# GEMINI — TRANSCRIPCIÓN DE AUDIO/VOZ
+# ─────────────────────────────────────────
+
+async def transcribir_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """
+    Envía audio a Gemini y devuelve la transcripción en texto.
+    Telegram envía voz como audio/ogg con codecs opus.
+    """
+    try:
+        audio_b64 = base64.b64encode(audio_bytes).decode()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": audio_b64
+                        }
+                    },
+                    {
+                        "text": "Transcribe exactamente lo que se dice en este audio. Devuelve solo la transcripción, sin comentarios."
+                    }
+                ]
+            }],
+            "generationConfig": {"maxOutputTokens": 500, "temperature": 0.2}
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, json=payload)
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        logging.error(f"Error transcribiendo audio: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────
+# GEMINI — DESCRIPCIÓN DE VIDEO
+# ─────────────────────────────────────────
+
+async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4") -> str:
+    """
+    Envía video a Gemini y devuelve una descripción de lo que ocurre.
+    Solo funciona bien con videos cortos (< 1 min recomendado).
+    """
+    try:
+        video_b64 = base64.b64encode(video_bytes).decode()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": video_b64
+                        }
+                    },
+                    {
+                        "text": "Describe detalladamente lo que ocurre en este video. Sé específico sobre personas, acciones, ambiente, texto visible y cualquier detalle relevante. Responde en español."
+                    }
+                ]
+            }],
+            "generationConfig": {"maxOutputTokens": 600, "temperature": 0.4}
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(url, json=payload)
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        logging.error(f"Error describiendo video: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────
+# FUNCIÓN CENTRAL — CLAUDE RESPONDE
+# ─────────────────────────────────────────
+
+async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                messages_payload: list, texto_para_historial: str):
+    """
+    Llama a Claude con el payload construido, agrega consejero Gemini
+    y devuelve la respuesta final al usuario.
+    """
+    historial = cargar_historial()
+    system = get_system_prompt(formatear_memoria())
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action="typing"
+    )
+
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=system,
+            messages=historial[-MAX_HISTORIAL:] + messages_payload
+        )
+        respuesta_claude = response.content[0].text
+
+        # Gemini como consejero
+        adicion_gemini = await consultar_gemini(texto_para_historial, respuesta_claude)
+
+        respuesta_final = (
+            f"{respuesta_claude}\n\n〔Consejero〕 {adicion_gemini}"
+            if adicion_gemini else respuesta_claude
+        )
+
+        # Guardar en historial como texto plano
+        historial.append({"role": "user", "content": texto_para_historial})
+        historial.append({"role": "assistant", "content": respuesta_claude})
+        guardar_historial(historial)
+
+        await update.message.reply_text(respuesta_final)
+
+    except Exception as e:
+        logging.error(f"Error Claude: {e}")
+        await update.message.reply_text("Algo falló. Intenta de nuevo.")
 
 
 # ─────────────────────────────────────────
@@ -183,45 +301,154 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Conversación reiniciada. La memoria permanente sigue intacta.")
 
 
+# ── TEXTO ──
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    historial = cargar_historial()
-
-    historial.append({"role": "user", "content": user_text})
-
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
+    await responder_con_claude(
+        update, context,
+        messages_payload=[{"role": "user", "content": user_text}],
+        texto_para_historial=user_text
     )
 
-    try:
-        # ── CLAUDE responde primero (el rey) ──
-        system = get_system_prompt(formatear_memoria())
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=system,
-            messages=historial[-MAX_HISTORIAL:]
+
+# ── IMAGEN ── (Claude Vision nativo)
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caption = update.message.caption or "¿Qué ves en esta imagen? Descríbela y comenta lo que consideres relevante para mí."
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Descargar imagen en memoria
+    photo = update.message.photo[-1]  # mayor resolución
+    file = await context.bot.get_file(photo.file_id)
+    photo_bytes = await file.download_as_bytearray()
+    photo_b64 = base64.b64encode(photo_bytes).decode()
+
+    # Payload con visión para Claude
+    mensaje_con_imagen = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": photo_b64
+                }
+            },
+            {"type": "text", "text": caption}
+        ]
+    }
+
+    texto_historial = f"[Imagen enviada] {caption}"
+    await responder_con_claude(update, context, [mensaje_con_imagen], texto_historial)
+
+
+# ── VOZ ── (Gemini transcribe → Claude responde)
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    audio_bytes = await file.download_as_bytearray()
+
+    await update.message.reply_text("🎙️ Escuchando...")
+
+    transcripcion = await transcribir_audio_gemini(bytes(audio_bytes), mime_type="audio/ogg")
+
+    if not transcripcion:
+        await update.message.reply_text("No pude entender el audio. Intenta de nuevo o escríbelo.")
+        return
+
+    await update.message.reply_text(f"📝 Entendí: _{transcripcion}_", parse_mode="Markdown")
+
+    # Claude responde a la transcripción
+    await responder_con_claude(
+        update, context,
+        messages_payload=[{"role": "user", "content": transcripcion}],
+        texto_para_historial=f"[Audio transcrito] {transcripcion}"
+    )
+
+
+# ── AUDIO (archivos de música/audio enviados como archivo) ──
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    audio = update.message.audio
+    file = await context.bot.get_file(audio.file_id)
+    audio_bytes = await file.download_as_bytearray()
+
+    mime = audio.mime_type or "audio/mpeg"
+    await update.message.reply_text("🎵 Procesando audio...")
+
+    transcripcion = await transcribir_audio_gemini(bytes(audio_bytes), mime_type=mime)
+
+    if not transcripcion:
+        await update.message.reply_text("No pude procesar este audio.")
+        return
+
+    await update.message.reply_text(f"📝 Contenido del audio:\n_{transcripcion}_", parse_mode="Markdown")
+    await responder_con_claude(
+        update, context,
+        messages_payload=[{"role": "user", "content": transcripcion}],
+        texto_para_historial=f"[Audio transcrito] {transcripcion}"
+    )
+
+
+# ── VIDEO ── (Gemini describe → Claude responde)
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caption = update.message.caption or ""
+    video = update.message.video
+
+    # Advertir si el video es muy pesado (Telegram limita a ~50MB en bots)
+    if video.file_size and video.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠️ El video es muy pesado para procesarlo en línea. "
+            "Envíame uno de menos de 20MB o cuéntame qué hay en él."
         )
-        respuesta_claude = response.content[0].text
+        return
 
-        # ── GEMINI revisa como consejero ──
-        adicion_gemini = await consultar_gemini(user_text, respuesta_claude)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await update.message.reply_text("🎬 Analizando video...")
 
-        # ── Construir respuesta final ──
-        if adicion_gemini:
-            respuesta_final = f"{respuesta_claude}\n\n〔Consejero〕 {adicion_gemini}"
-        else:
-            respuesta_final = respuesta_claude
+    file = await context.bot.get_file(video.file_id)
+    video_bytes = await file.download_as_bytearray()
 
-        historial.append({"role": "assistant", "content": respuesta_claude})
-        guardar_historial(historial)
+    mime = video.mime_type or "video/mp4"
+    descripcion = await describir_video_gemini(bytes(video_bytes), mime_type=mime)
 
-        await update.message.reply_text(respuesta_final)
+    if not descripcion:
+        await update.message.reply_text("No pude analizar el video.")
+        return
 
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text("Algo falló. Intenta de nuevo.")
+    contexto_completo = f"{caption}\n\nDescripción del video: {descripcion}".strip() if caption else f"Descripción del video: {descripcion}"
+
+    await responder_con_claude(
+        update, context,
+        messages_payload=[{"role": "user", "content": contexto_completo}],
+        texto_para_historial=f"[Video enviado] {contexto_completo}"
+    )
+
+
+# ── VIDEO NOTE (video circulito de Telegram) ──
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await update.message.reply_text("🎬 Analizando video...")
+
+    video_note = update.message.video_note
+    file = await context.bot.get_file(video_note.file_id)
+    video_bytes = await file.download_as_bytearray()
+
+    descripcion = await describir_video_gemini(bytes(video_bytes), mime_type="video/mp4")
+
+    if not descripcion:
+        await update.message.reply_text("No pude analizar el video.")
+        return
+
+    await responder_con_claude(
+        update, context,
+        messages_payload=[{"role": "user", "content": f"Descripción del video: {descripcion}"}],
+        texto_para_historial=f"[Video circular] {descripcion}"
+    )
 
 
 # ─────────────────────────────────────────
@@ -236,7 +463,16 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("memoria", ver_memoria))
     app.add_handler(CommandHandler("olvida", olvida))
     app.add_handler(CommandHandler("reset", reset))
+
+    # Media handlers
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+
+    # Texto al final (siempre)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en línea — cerebro doble activo...")
+    print("Cortana en línea — multimedia activo...")
     app.run_polling()
