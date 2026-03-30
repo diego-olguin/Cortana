@@ -1,7 +1,7 @@
 import os
 import json
 import psycopg2
-import google.generativeai as genai
+from google import genai as genai_client
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -10,7 +10,7 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai_client.Client(api_key=GEMINI_API_KEY)
 
 
 def get_conn():
@@ -21,12 +21,11 @@ def generar_embedding(texto: str) -> list:
     """
     Genera un embedding de 768 dimensiones usando Gemini.
     """
-    result = genai.embed_content(
-        model="models/text-embedding-004",
-        content=texto,
-        task_type="retrieval_document"
+    result = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=texto
     )
-    return result['embedding']
+    return result.embeddings[0].values
 
 
 def guardar_recuerdo(contenido: str, tipo: str = "conversacion"):
