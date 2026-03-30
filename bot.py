@@ -8,6 +8,8 @@ import httpx
 from system_prompt import get_system_prompt
 from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje
 from gmail import leer_emails_no_leidos, enviar_email
+from sheets import leer_sheet, escribir_sheet
+from docs import crear_documento, listar_documentos
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,7 +25,6 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 init_db()
 
-# Estado temporal para borradores de email
 email_draft = {}
 
 
@@ -63,7 +64,6 @@ async def transcribir_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/o
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(url, json=payload)
             data = r.json()
-            logging.info(f"Gemini audio response: {data}")
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
         logging.error(f"Error transcribiendo audio: {e}")
@@ -86,6 +86,32 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
     except Exception as e:
         logging.error(f"Error describiendo video: {e}")
         return ""
+
+
+def detectar_intencion(texto: str) -> str:
+    texto_lower = texto.lower()
+
+    palabras_mail = ["correo", "mail", "email", "mensaje", "inbox", "bandeja", "escribio", "mando un mail",
+                     "mando correo", "recibiste", "tiene correo", "tengo correo", "no leidos", "sin leer"]
+    palabras_redactar = ["redacta", "escribe un correo", "prepara un mail", "manda un correo",
+                         "envia un correo", "correo para", "mail para", "email para"]
+    palabras_enviar = ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "manda el correo"]
+    palabras_sheet = ["sheets", "hoja", "spreadsheet", "tabla", "excel", "registro", "agrega a la hoja",
+                      "guarda en sheets", "anota en la tabla", "actualiza la hoja"]
+    palabras_doc = ["documento", "contrato", "cotizacion", "doc", "crea un documento", "genera un contrato",
+                    "redacta un contrato", "prepara la cotizacion"]
+
+    if any(p in texto_lower for p in palabras_enviar):
+        return "enviar_mail"
+    if any(p in texto_lower for p in palabras_redactar):
+        return "redactar_mail"
+    if any(p in texto_lower for p in palabras_mail):
+        return "leer_mail"
+    if any(p in texto_lower for p in palabras_sheet):
+        return "sheets"
+    if any(p in texto_lower for p in palabras_doc):
+        return "docs"
+    return "chat"
 
 
 async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -123,14 +149,15 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Cortana en linea.\n\n"
+        "Puedes hablarme naturalmente sobre:\n"
+        "- Tus correos (leer, redactar, enviar)\n"
+        "- Google Sheets (registrar, actualizar datos)\n"
+        "- Google Docs (crear contratos, cotizaciones)\n\n"
         "Comandos:\n"
-        "/recuerda [hecho] — Memoria permanente\n"
-        "/memoria — Ver memoria\n"
-        "/olvida [numero] — Borrar hecho\n"
-        "/reset — Limpiar conversacion\n"
-        "/mails — Ver correos no leidos\n"
-        "/redactar [para] [asunto] — Redactar correo\n"
-        "/enviar — Enviar borrador aprobado"
+        "/recuerda [hecho]\n"
+        "/memoria\n"
+        "/olvida [numero]\n"
+        "/reset"
     )
 
 
@@ -166,13 +193,12 @@ async def olvida(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"Borrado:\n- {borrado}")
     except ValueError:
-        await update.message.reply_text("Usa un numero. Ejemplo:\n/olvida 2")
+        await update.message.reply_text("Usa un numero.")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import psycopg2
-    DATABASE_URL = os.getenv("DATABASE_URL")
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
     cur.execute("DELETE FROM historial")
     conn.commit()
@@ -181,110 +207,130 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Conversacion reiniciada. Memoria permanente intacta.")
 
 
-# ── GMAIL ──
-
-async def ver_mails(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    try:
-        emails = leer_emails_no_leidos(5)
-        if not emails:
-            await update.message.reply_text("No tienes correos no leidos.")
-            return
-        texto = "Correos no leidos:\n\n"
-        for i, email in enumerate(emails, 1):
-            texto += f"{i}. De: {email['from']}\n   Asunto: {email['subject']}\n   {email['snippet'][:100]}...\n\n"
-        await update.message.reply_text(texto)
-    except Exception as e:
-        logging.error(f"Error leyendo mails: {e}")
-        await update.message.reply_text("Error al leer correos.")
-
-
-async def redactar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: /redactar correo@destino Asunto del correo")
-        return
-
-    destinatario = context.args[0]
-    asunto = " ".join(context.args[1:])
-    chat_id = update.effective_chat.id
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    prompt = f"Redacta un correo profesional para {destinatario} con el asunto: {asunto}. Firma como Diego Olguin de Eclipse Estudio. Solo el cuerpo del correo, sin comentarios adicionales."
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    borrador = response.content[0].text
-
-    email_draft[chat_id] = {
-        "to": destinatario,
-        "subject": asunto,
-        "body": borrador
-    }
-
-    await update.message.reply_text(
-        f"Borrador listo:\n\nPara: {destinatario}\nAsunto: {asunto}\n\n{borrador}\n\n"
-        "Si quieres enviarlo escribe /enviar\n"
-        "Si quieres modificarlo dime que cambiar y lo corrijo."
-    )
-
-
-async def enviar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id not in email_draft:
-        await update.message.reply_text("No hay borrador pendiente. Usa /redactar primero.")
-        return
-
-    draft = email_draft[chat_id]
-    try:
-        enviar_email(draft["to"], draft["subject"], draft["body"])
-        del email_draft[chat_id]
-        await update.message.reply_text(f"Correo enviado a {draft['to']}.")
-    except Exception as e:
-        logging.error(f"Error enviando mail: {e}")
-        await update.message.reply_text("Error al enviar. Revisa la conexion con Gmail.")
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
 
-    # Si hay borrador activo, permite modificarlo
+    # Si hay borrador activo, permite modificarlo o enviarlo
     if chat_id in email_draft:
+        intencion = detectar_intencion(user_text)
+        if intencion == "enviar_mail":
+            draft = email_draft[chat_id]
+            try:
+                enviar_email(draft["to"], draft["subject"], draft["body"])
+                del email_draft[chat_id]
+                await update.message.reply_text(f"Correo enviado a {draft['to']}.")
+            except Exception as e:
+                await update.message.reply_text(f"Error al enviar: {e}")
+            return
+        else:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            draft = email_draft[chat_id]
+            prompt = f"Este es el borrador actual:\n\n{draft['body']}\n\nEl usuario pide este cambio: {user_text}\n\nDevuelve solo el cuerpo del correo corregido."
+            response = claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            nuevo_borrador = response.content[0].text
+            email_draft[chat_id]["body"] = nuevo_borrador
+            await update.message.reply_text(
+                f"Borrador actualizado:\n\n{nuevo_borrador}\n\n"
+                "Dime 'envialo' para mandarlo o sigue ajustando."
+            )
+            return
+
+    intencion = detectar_intencion(user_text)
+
+    if intencion == "leer_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        draft = email_draft[chat_id]
-        prompt = f"Este es el borrador actual:\n\n{draft['body']}\n\nEl usuario pide este cambio: {user_text}\n\nDevuelve solo el cuerpo del correo corregido."
+        try:
+            emails = leer_emails_no_leidos(5)
+            if not emails:
+                contexto = "El usuario pregunto por sus correos. No hay correos no leidos en este momento."
+            else:
+                resumen = "\n".join([f"- De: {e['from']} | Asunto: {e['subject']} | {e['snippet'][:80]}" for e in emails])
+                contexto = f"El usuario pregunto por sus correos. Estos son los correos no leidos:\n{resumen}\n\nResponde de forma natural sobre estos correos."
+            await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text)
+        except Exception as e:
+            logging.error(f"Error Gmail: {e}")
+            await update.message.reply_text("No pude acceder a Gmail en este momento.")
+
+    elif intencion == "redactar_mail":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        prompt = f"El usuario quiere redactar un correo. Su mensaje: {user_text}\n\nExtrae destinatario, asunto y redacta el cuerpo del correo profesional firmado como Diego Olguin de Eclipse Estudio. Responde en este formato exacto:\nPARA: email@destino.com\nASUNTO: asunto del correo\nCUERPO:\n[cuerpo del correo]"
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}]
         )
-        nuevo_borrador = response.content[0].text
-        email_draft[chat_id]["body"] = nuevo_borrador
-        await update.message.reply_text(
-            f"Borrador actualizado:\n\n{nuevo_borrador}\n\n"
-            "Escribe /enviar para mandarlo o sigue ajustando."
-        )
-        return
+        resultado = response.content[0].text
 
-    await responder_con_claude(
-        update, context,
-        messages_payload=[{"role": "user", "content": user_text}],
-        texto_para_historial=user_text
-    )
+        lineas = resultado.split('\n')
+        para = ""
+        asunto = ""
+        cuerpo_lines = []
+        en_cuerpo = False
+        for linea in lineas:
+            if linea.startswith("PARA:"):
+                para = linea.replace("PARA:", "").strip()
+            elif linea.startswith("ASUNTO:"):
+                asunto = linea.replace("ASUNTO:", "").strip()
+            elif linea.startswith("CUERPO:"):
+                en_cuerpo = True
+            elif en_cuerpo:
+                cuerpo_lines.append(linea)
+        cuerpo = "\n".join(cuerpo_lines).strip()
+
+        if para and asunto and cuerpo:
+            email_draft[chat_id] = {"to": para, "subject": asunto, "body": cuerpo}
+            await update.message.reply_text(
+                f"Borrador listo:\n\nPara: {para}\nAsunto: {asunto}\n\n{cuerpo}\n\n"
+                "Dime 'envialo' para mandarlo o ajusta lo que necesites."
+            )
+        else:
+            await update.message.reply_text(resultado)
+
+    elif intencion == "sheets":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await responder_con_claude(
+            update, context,
+            [{"role": "user", "content": f"{user_text}\n\n[Nota: El usuario quiere trabajar con Google Sheets. Pidele el ID del spreadsheet o el nombre de la hoja si no lo has dado. Explica como puede compartir el link del sheet para que puedas acceder.]"}],
+            user_text
+        )
+
+    elif intencion == "docs":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        prompt = f"El usuario quiere crear un documento de Google Docs. Su mensaje: {user_text}\n\nGenera el contenido completo del documento (contrato, cotizacion, etc) profesional para Eclipse Estudio de Diego Olguin. Empieza directamente con el contenido del documento."
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        contenido = response.content[0].text
+        titulo = user_text[:50]
+
+        try:
+            url = crear_documento(titulo, contenido)
+            await update.message.reply_text(f"Documento creado:\n{url}\n\nContenido:\n{contenido[:500]}...")
+        except Exception as e:
+            logging.error(f"Error Docs: {e}")
+            await update.message.reply_text(f"No pude crear el documento. Error: {e}")
+
+    else:
+        await responder_con_claude(
+            update, context,
+            messages_payload=[{"role": "user", "content": user_text}],
+            texto_para_historial=user_text
+        )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Que ves en esta imagen? Describela y comenta lo relevante."
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     photo_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
-
     mensaje = {
         "role": "user",
         "content": [
@@ -299,14 +345,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     file = await context.bot.get_file(update.message.voice.file_id)
     audio_bytes = bytes(await file.download_as_bytearray())
-
     await update.message.reply_text("Escuchando...")
     transcripcion = await transcribir_audio_gemini(audio_bytes, "audio/ogg")
-
     if not transcripcion:
         await update.message.reply_text("No pude entender el audio.")
         return
-
     await update.message.reply_text(f"Entendi: {transcripcion}")
     await responder_con_claude(
         update, context,
@@ -321,14 +364,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await context.bot.get_file(audio.file_id)
     audio_bytes = bytes(await file.download_as_bytearray())
     mime = audio.mime_type or "audio/mpeg"
-
     await update.message.reply_text("Procesando audio...")
     transcripcion = await transcribir_audio_gemini(audio_bytes, mime)
-
     if not transcripcion:
         await update.message.reply_text("No pude procesar este audio.")
         return
-
     await update.message.reply_text(f"Contenido:\n{transcripcion}")
     await responder_con_claude(
         update, context,
@@ -342,40 +382,32 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if video.file_size and video.file_size > 20 * 1024 * 1024:
         await update.message.reply_text("El video es muy pesado. Menos de 20MB.")
         return
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     await update.message.reply_text("Analizando video...")
-
     file = await context.bot.get_file(video.file_id)
     video_bytes = bytes(await file.download_as_bytearray())
     mime = video.mime_type or "video/mp4"
     descripcion = await describir_video_gemini(video_bytes, mime)
-
     if not descripcion:
         await update.message.reply_text("No pude analizar el video.")
         return
-
     caption = update.message.caption or ""
     if caption:
         contenido = f"Diego mando un video con el mensaje: {caption}. Gemini analizo el video y detecto: {descripcion}. Comenta sobre esto."
     else:
         contenido = f"Diego mando un video. Gemini lo analizo y detecto: {descripcion}. Comenta sobre esto."
-
     await responder_con_claude(update, context, [{"role": "user", "content": contenido}], f"[Video] {contenido}")
 
 
 async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     await update.message.reply_text("Analizando video...")
-
     file = await context.bot.get_file(update.message.video_note.file_id)
     video_bytes = bytes(await file.download_as_bytearray())
     descripcion = await describir_video_gemini(video_bytes, "video/mp4")
-
     if not descripcion:
         await update.message.reply_text("No pude analizar el video.")
         return
-
     contenido = f"Diego mando un video circular. Gemini lo analizo y detecto: {descripcion}. Comenta sobre esto."
     await responder_con_claude(update, context, [{"role": "user", "content": contenido}], f"[Video circular] {descripcion}")
 
@@ -388,9 +420,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("memoria", ver_memoria))
     app.add_handler(CommandHandler("olvida", olvida))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("mails", ver_mails))
-    app.add_handler(CommandHandler("redactar", redactar))
-    app.add_handler(CommandHandler("enviar", enviar))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -399,5 +428,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Gmail activo...")
+    print("Cortana en linea - Gmail, Sheets y Docs activos...")
     app.run_polling()
