@@ -105,7 +105,7 @@ RESPUESTA DE CLAUDE:
 ¿Tienes algo relevante que agregar?"""
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [{"text": prompt_consejero}]}],
             "generationConfig": {"maxOutputTokens": 300, "temperature": 0.7}
@@ -128,7 +128,7 @@ RESPUESTA DE CLAUDE:
 
 async def transcribir_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [
                 {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode()}},
@@ -157,7 +157,7 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
     """
     try:
         video_b64 = base64.b64encode(video_bytes).decode()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{
                 "parts": [
