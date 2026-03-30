@@ -3,18 +3,21 @@ import re
 import json
 import base64
 import logging
-from datetime import datetime, date, time
+from datetime import datetime, date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 import httpx
 from system_prompt import get_system_prompt
-from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje, guardar_config, leer_config
+from db import (init_db, cargar_memoria, agregar_hecho, borrar_hecho,
+                formatear_memoria, cargar_historial, guardar_mensaje,
+                guardar_config, leer_config)
 from gmail import leer_emails_no_leidos, buscar_emails, enviar_email, compartir_drive, listar_drive
 from sheets import registrar_egreso, registrar_ingreso_extra, registrar_ingreso_fijo, leer_sheet, CATEGORIAS_VALIDAS
 from docs import crear_documento
 from calendar_module import crear_evento, listar_eventos
 from diario import escribir_entrada_diario, leer_entradas_recientes, obtener_contexto_para_system_prompt
+from memoria_semantica import guardar_recuerdo, buscar_recuerdos, formatear_recuerdos_para_contexto
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -36,40 +39,66 @@ ingreso_pendiente = {}
 SHEET_FINANZAS_ID = "1vNs6j2ZaYuwIKw2DVrBa1n3CVKLDuIwEtQJU9BTWpf0"
 SHEET_FINANZAS_PESTANA = "Marzo"
 
-# Hora en que Cortana escribe su diario (hora UTC — 11pm CDMX = 4am UTC)
 HORA_DIARIO_UTC = 4
 ultimo_diario_escrito = None
 
 
 async def check_diario(context):
-    """
-    Tarea programada — escribe el diario si es la hora correcta y no se ha escrito hoy.
-    """
     global ultimo_diario_escrito
     ahora = datetime.utcnow()
     hoy = date.today()
-
     if ahora.hour == HORA_DIARIO_UTC and ultimo_diario_escrito != hoy:
         try:
             logging.info("Escribiendo entrada del diario de Cortana...")
             escribir_entrada_diario()
             ultimo_diario_escrito = hoy
-            logging.info("Diario escrito correctamente.")
+            logging.info("Diario escrito.")
         except Exception as e:
-            logging.error(f"Error escribiendo diario: {e}")
+            logging.error(f"Error diario: {e}")
+
+
+async def extraer_y_guardar_recuerdos(user_text: str, respuesta: str):
+    """
+    Despues de cada conversacion, extrae lo relevante y lo guarda en memoria semantica.
+    Solo guarda si hay contenido sustancial — no guarda saludos ni mensajes triviales.
+    """
+    try:
+        # Guardar mensaje del usuario si es sustancial
+        if len(user_text) > 40 and not any(p in user_text.lower() for p in
+                                            ["hola", "ok", "bien", "gracias", "si", "no", "dale"]):
+            guardar_recuerdo(user_text, "diego")
+
+        # Extraer hechos importantes de la respuesta para guardarlos
+        prompt = f"""Analiza este intercambio y extrae SOLO los hechos concretos e importantes sobre Diego, sus proyectos, clientes, o decisiones. Si no hay nada importante, responde: [NADA]
+
+Diego dijo: {user_text[:300]}
+Cortana respondio: {respuesta[:300]}
+
+Extrae maximo 2 hechos concretos en una sola linea cada uno. Sin introduccion."""
+
+        r = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        hechos = r.content[0].text.strip()
+        if "[NADA]" not in hechos and len(hechos) > 20:
+            for linea in hechos.split('\n'):
+                if linea.strip() and len(linea.strip()) > 20:
+                    guardar_recuerdo(linea.strip(), "hecho_extraido")
+    except Exception as e:
+        logging.error(f"Error extrayendo recuerdos: {e}")
 
 
 async def consultar_gemini(respuesta_claude: str) -> str:
-    prompt = f"""Eres un consejero experto en negocios, video y estrategia digital. Acabas de leer esta respuesta de Cortana:
+    prompt = f"""Eres un consejero experto en negocios, video y estrategia digital.
 
 {respuesta_claude}
 
 Criterios estrictos:
-- Solo habla si puedes agregar algo CONCRETO que Cortana NO menciono y que cambia algo.
-- Si Cortana cubrio bien el tema, responde exactamente: [SILENCIO]
-- Si tienes algo que agregar, UN parrafo completo y directo. Nunca incompleto.
-
-Tienes algo que agregar?"""
+- Solo habla si puedes agregar algo CONCRETO que Cortana NO menciono.
+- Si no, responde exactamente: [SILENCIO]
+- Si tienes algo, UN parrafo completo. Nunca incompleto."""
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 200, "temperature": 0.5}}
@@ -119,7 +148,6 @@ async def describir_video_gemini(video_bytes: bytes, mime_type: str = "video/mp4
 
 def detectar_intencion(texto: str) -> str:
     t = texto.lower()
-
     if any(p in t for p in ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "dale envia"]):
         return "enviar_mail"
     if any(p in t for p in ["redacta un correo", "escribe un correo", "prepara un mail",
@@ -159,9 +187,14 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
                                 usar_consejero: bool = True):
     historial = cargar_historial(MAX_HISTORIAL)
 
-    # Incluir contexto del diario en el system prompt
+    # Buscar recuerdos semanticamente relevantes
+    recuerdos = buscar_recuerdos(texto_para_historial, limite=4, umbral=0.72)
+    contexto_recuerdos = formatear_recuerdos_para_contexto(recuerdos)
+
+    # Incluir diario reciente
     diario_contexto = obtener_contexto_para_system_prompt()
-    system = get_system_prompt(formatear_memoria()) + diario_contexto
+
+    system = get_system_prompt(formatear_memoria()) + contexto_recuerdos + diario_contexto
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
@@ -173,13 +206,21 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         respuesta_claude = response.content[0].text
         respuesta_final = respuesta_claude
+
         if usar_consejero:
             adicion = await consultar_gemini(respuesta_claude)
             if adicion:
                 respuesta_final = f"{respuesta_claude}\n\n{adicion}"
+
         guardar_mensaje("user", texto_para_historial)
         guardar_mensaje("assistant", respuesta_claude)
+
+        # Guardar en memoria semantica en segundo plano
+        import asyncio
+        asyncio.create_task(extraer_y_guardar_recuerdos(texto_para_historial, respuesta_claude))
+
         await update.message.reply_text(respuesta_final)
+
     except Exception as e:
         logging.error(f"Error Claude: {e}")
         await update.message.reply_text("Algo fallo. Intenta de nuevo.")
@@ -201,16 +242,16 @@ MENSAJE: {user_text}
 
 Devuelve SOLO un JSON valido sin texto adicional ni backticks:
 
-Si es GASTO (pago, compra, gasto):
+Si es GASTO:
 {{"tipo_flujo": "egreso", "datos": {{"categoria": "categoria valida", "descripcion": "lugar o concepto", "importe": 160.00, "fecha": "{hoy}", "metodo": "Efectivo"}}}}
 
 Si es INGRESO:
 {{"tipo_flujo": "ingreso", "datos": {{"descripcion": "cliente o concepto", "monto_deben": 0, "monto_pagado": 5000.00, "fecha": "{hoy}"}}}}
 
-Si es CONSULTA de saldos:
+Si es CONSULTA:
 {{"tipo_flujo": "consulta", "pregunta": "que quiere saber"}}
 
-Si NO hay suficiente informacion para registrar:
+Si falta informacion:
 {{"tipo_flujo": "falta_info", "mensaje": "que falta"}}"""
 
     try:
@@ -225,15 +266,13 @@ Si NO hay suficiente informacion para registrar:
         datos = resultado.get("datos", {})
 
         if tipo == "egreso":
-            # Si falta el metodo de pago, preguntar
-            if not datos.get("metodo") or datos.get("metodo") == "":
+            if not datos.get("metodo"):
                 guardar_config("egreso_pendiente", json.dumps(datos))
                 await update.message.reply_text(
                     f"Detecto: {datos.get('categoria')} | {datos.get('descripcion')} | ${datos.get('importe')}\n\n"
                     "Como pagaste? Efectivo, BBVA, Santander, Nu?"
                 )
                 return
-
             fila = registrar_egreso(
                 SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
                 datos.get("categoria", "OTRO"),
@@ -263,10 +302,10 @@ Si NO hay suficiente informacion para registrar:
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
 
         else:
-            await update.message.reply_text("No entendi bien. Dame: que fue, cuanto y como pagaste.")
+            await update.message.reply_text("Dame: que fue, cuanto y como pagaste.")
 
     except json.JSONDecodeError:
-        await update.message.reply_text("No pude interpretar. Dame: que compraste/pagaste, cuanto y con que metodo.")
+        await update.message.reply_text("No pude interpretar. Dame: que compraste, cuanto y con que metodo.")
     except Exception as e:
         logging.error(f"Error sheets: {e}")
         await update.message.reply_text(f"Error al registrar: {e}")
@@ -275,14 +314,14 @@ Si NO hay suficiente informacion para registrar:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Cortana en linea.\n\n"
-        "Habla naturalmente. Tengo acceso a tu Gmail, Calendar, Drive y Sheets.\n\n"
         "Comandos:\n"
         "/recuerda [hecho]\n"
         "/memoria\n"
         "/olvida [numero]\n"
         "/reset\n"
-        "/diario — leer mis entradas recientes\n"
-        "/diario_hoy — escribir entrada de hoy ahora"
+        "/diario — leer entradas recientes\n"
+        "/diario_hoy — escribir entrada ahora\n"
+        "/buscar [tema] — buscar en memoria semantica"
     )
 
 
@@ -292,7 +331,8 @@ async def recuerda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Dime que guardar.")
         return
     agregar_hecho(texto)
-    await update.message.reply_text(f"Guardado:\n- {texto}")
+    guardar_recuerdo(texto, "memoria_manual")
+    await update.message.reply_text(f"Guardado en memoria:\n- {texto}")
 
 
 async def ver_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,7 +377,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ver_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entradas = leer_entradas_recientes(3)
     if not entradas:
-        await update.message.reply_text("No hay entradas en el diario todavia. Usa /diario_hoy para escribir la primera.")
+        await update.message.reply_text("No hay entradas todavia. Usa /diario_hoy.")
         return
     texto = ""
     for e in reversed(entradas):
@@ -346,13 +386,30 @@ async def ver_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def diario_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Escribiendo entrada del diario...")
+    await update.message.reply_text("Escribiendo...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         entrada = escribir_entrada_diario()
         await update.message.reply_text(f"— {date.today()} —\n\n{entrada}")
     except Exception as e:
-        await update.message.reply_text(f"Error al escribir el diario: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def buscar_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Dime que buscar. Ejemplo:\n/buscar proyectos con clientes")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    recuerdos = buscar_recuerdos(query, limite=5, umbral=0.65)
+    if not recuerdos:
+        await update.message.reply_text("No encontre nada relevante en mi memoria.")
+        return
+    texto = f"Lo que recuerdo sobre '{query}':\n\n"
+    for r in recuerdos:
+        fecha = r['fecha'][:10]
+        texto += f"[{fecha}] {r['contenido'][:150]}\n\n"
+    await update.message.reply_text(texto)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,20 +422,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if egreso_raw:
         try:
             datos = json.loads(egreso_raw)
-            # Detectar metodo de pago en la respuesta
             metodo = ""
-            if any(p in texto_lower for p in ["efectivo", "cash"]):
-                metodo = "Efectivo"
-            elif any(p in texto_lower for p in ["bbva", "banamex"]):
-                metodo = "BBVA"
-            elif any(p in texto_lower for p in ["santander"]):
-                metodo = "Santander"
-            elif any(p in texto_lower for p in ["nu", "nubank"]):
-                metodo = "Nu"
-            elif any(p in texto_lower for p in ["tarjeta", "credito", "debito"]):
-                metodo = "Tarjeta"
-            elif any(p in texto_lower for p in ["transferencia", "spei"]):
-                metodo = "Transferencia"
+            if any(p in texto_lower for p in ["efectivo", "cash"]): metodo = "Efectivo"
+            elif any(p in texto_lower for p in ["bbva", "banamex"]): metodo = "BBVA"
+            elif any(p in texto_lower for p in ["santander"]): metodo = "Santander"
+            elif any(p in texto_lower for p in ["nu", "nubank"]): metodo = "Nu"
+            elif any(p in texto_lower for p in ["tarjeta", "credito", "debito"]): metodo = "Tarjeta"
+            elif any(p in texto_lower for p in ["transferencia", "spei"]): metodo = "Transferencia"
 
             if metodo:
                 datos["metodo"] = metodo
@@ -412,12 +462,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "fijo" in texto_lower:
             try:
                 datos = ingreso_pendiente[chat_id]
-                fila = registrar_ingreso_fijo(
-                    SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
-                    datos.get("descripcion", ""),
-                    datos.get("monto_deben", 0),
-                    datos.get("monto_pagado", 0)
-                )
+                fila = registrar_ingreso_fijo(SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
+                    datos.get("descripcion", ""), datos.get("monto_deben", 0), datos.get("monto_pagado", 0))
                 del ingreso_pendiente[chat_id]
                 monto = datos.get("monto_pagado") or datos.get("monto_deben")
                 await update.message.reply_text(f"Ingreso fijo registrado (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
@@ -427,12 +473,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif any(p in texto_lower for p in ["extra", "freelance", "proyecto", "variable"]):
             try:
                 datos = ingreso_pendiente[chat_id]
-                fila = registrar_ingreso_extra(
-                    SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
-                    datos.get("descripcion", ""),
-                    datos.get("monto_deben", 0),
-                    datos.get("monto_pagado", 0)
-                )
+                fila = registrar_ingreso_extra(SHEET_FINANZAS_ID, SHEET_FINANZAS_PESTANA,
+                    datos.get("descripcion", ""), datos.get("monto_deben", 0), datos.get("monto_pagado", 0))
                 del ingreso_pendiente[chat_id]
                 monto = datos.get("monto_pagado") or datos.get("monto_deben")
                 await update.message.reply_text(f"Ingreso extra registrado (fila {fila}):\n{datos.get('descripcion')} | ${monto}")
@@ -452,7 +494,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 del email_draft[chat_id]
                 await update.message.reply_text(f"Correo enviado a {draft['to']}.")
             except Exception as e:
-                await update.message.reply_text(f"Error al enviar: {e}")
+                await update.message.reply_text(f"Error: {e}")
             return
         elif any(p in texto_lower for p in ["no", "cancel", "olvida"]):
             del email_draft[chat_id]
@@ -472,12 +514,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intencion == "leer_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            prompt_q = f"El usuario pregunta: {user_text}\n\nExtrae termino de busqueda para Gmail. Si menciona persona: 'from:nombre'. Si tema: el tema. Si todos: 'in:inbox'. Solo el termino."
+            prompt_q = f"Extrae termino de busqueda para Gmail del mensaje: {user_text}\nSi menciona persona: 'from:nombre'. Si tema: el tema. Si todos: 'in:inbox'. Solo el termino."
             r = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=50, messages=[{"role": "user", "content": prompt_q}])
             query = r.content[0].text.strip()
             emails = buscar_emails(query, max_results=5) or leer_emails_no_leidos(5)
             if not emails:
-                contexto = f"[DATOS: Gmail revisado. No se encontraron correos.]\n\nMensaje: {user_text}"
+                contexto = f"[DATOS: Gmail. No se encontraron correos.]\n\nMensaje: {user_text}"
             else:
                 resumen = "\n".join([f"- {'[NO LEIDO] ' if not e['leido'] else ''}De: {e['from']} | {e['subject']} | {e['date'][:16]} | {e['snippet'][:80]}" for e in emails])
                 contexto = f"[DATOS: Gmail. Correos:\n{resumen}]\n\nMensaje: {user_text}"
@@ -511,24 +553,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif intencion == "drive":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            if any(p in texto_lower for p in ["comparte", "compartir", "dar acceso"]):
-                prompt = f"Quiere compartir de Drive. Mensaje: {user_text}\n\nExtrae:\nARCHIVO: nombre\nEMAIL: email\nROL: reader/commenter/writer"
-                r = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=100, messages=[{"role": "user", "content": prompt}])
-                archivos = listar_drive(max_results=20)
-                nombre = email_dest = ""
-                rol = "reader"
-                for linea in r.content[0].text.split('\n'):
-                    if linea.startswith("ARCHIVO:"): nombre = linea.replace("ARCHIVO:", "").strip()
-                    elif linea.startswith("EMAIL:"): email_dest = linea.replace("EMAIL:", "").strip()
-                    elif linea.startswith("ROL:"): rol = linea.replace("ROL:", "").strip().lower()
-                encontrado = next((a for a in archivos if nombre.lower() in a['name'].lower()), None)
-                if encontrado and email_dest:
-                    from gmail import compartir_drive
-                    url = compartir_drive(encontrado['id'], email_dest, rol)
-                    await update.message.reply_text(f"'{encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}")
-                else:
-                    lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
-                    await update.message.reply_text(f"No encontre '{nombre}'. Archivos:\n{lista}")
+            prompt = f"Quiere compartir de Drive. Mensaje: {user_text}\n\nExtrae:\nARCHIVO: nombre\nEMAIL: email\nROL: reader/commenter/writer"
+            r = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=100, messages=[{"role": "user", "content": prompt}])
+            archivos = listar_drive(max_results=20)
+            nombre = email_dest = ""
+            rol = "reader"
+            for linea in r.content[0].text.split('\n'):
+                if linea.startswith("ARCHIVO:"): nombre = linea.replace("ARCHIVO:", "").strip()
+                elif linea.startswith("EMAIL:"): email_dest = linea.replace("EMAIL:", "").strip()
+                elif linea.startswith("ROL:"): rol = linea.replace("ROL:", "").strip().lower()
+            encontrado = next((a for a in archivos if nombre.lower() in a['name'].lower()), None)
+            if encontrado and email_dest:
+                url = compartir_drive(encontrado['id'], email_dest, rol)
+                await update.message.reply_text(f"'{encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}")
+            else:
+                lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
+                await update.message.reply_text(f"No encontre '{nombre}'. Archivos:\n{lista}")
         except Exception as e:
             await update.message.reply_text(f"Error Drive: {e}")
 
@@ -545,7 +585,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
             else:
                 hoy_str = datetime.now().strftime("%Y-%m-%d")
-                prompt = f"Crear evento. Mensaje: {user_text}\nHoy: {hoy_str}\n\nFormato:\nTITULO:\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION:\nINVITADOS: email1,email2\nRECORDATORIO: 30"
+                prompt = f"Crear evento. Mensaje: {user_text}\nHoy: {hoy_str}\n\nFormato:\nTITULO:\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION:\nINVITADOS:\nRECORDATORIO: 30"
                 response = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=300, messages=[{"role": "user", "content": prompt}])
                 datos = {}
                 for linea in response.content[0].text.split('\n'):
@@ -616,7 +656,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Procesando audio...")
     transcripcion = await transcribir_audio_gemini(audio_bytes, mime)
     if not transcripcion:
-        await update.message.reply_text("No pude procesar este audio.")
+        await update.message.reply_text("No pude procesar.")
         return
     await update.message.reply_text(f"Contenido:\n{transcripcion}")
     await responder_con_claude(update, context, [{"role": "user", "content": transcripcion}], f"[Audio] {transcripcion}")
@@ -633,7 +673,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_bytes = bytes(await file.download_as_bytearray())
     descripcion = await describir_video_gemini(video_bytes, video.mime_type or "video/mp4")
     if not descripcion:
-        await update.message.reply_text("No pude analizar el video.")
+        await update.message.reply_text("No pude analizar.")
         return
     caption = update.message.caption or ""
     contenido = f"Diego mando un video{' con el mensaje: ' + caption if caption else ''}. Gemini detecto: {descripcion}. Comenta."
@@ -647,17 +687,15 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_bytes = bytes(await file.download_as_bytearray())
     descripcion = await describir_video_gemini(video_bytes, "video/mp4")
     if not descripcion:
-        await update.message.reply_text("No pude analizar el video.")
+        await update.message.reply_text("No pude analizar.")
         return
     contenido = f"Diego mando un video circular. Gemini detecto: {descripcion}. Comenta."
     await responder_con_claude(update, context, [{"role": "user", "content": contenido}], f"[Video circular] {descripcion}")
 
 
 if __name__ == "__main__":
-    from telegram.ext import JobQueue
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Tarea nocturna del diario — cada hora revisa si es momento de escribir
     app.job_queue.run_repeating(check_diario, interval=3600, first=10)
 
     app.add_handler(CommandHandler("start", start))
@@ -667,6 +705,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("diario", ver_diario))
     app.add_handler(CommandHandler("diario_hoy", diario_hoy))
+    app.add_handler(CommandHandler("buscar", buscar_memoria))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -675,5 +714,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Diario activo...")
+    print("Cortana en linea - Memoria semantica + Diario activos...")
     app.run_polling()
