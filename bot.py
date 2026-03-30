@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import base64
 import logging
 from datetime import datetime
@@ -10,7 +11,7 @@ import httpx
 from system_prompt import get_system_prompt
 from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje, guardar_config, leer_config
 from gmail import leer_emails_no_leidos, buscar_emails, enviar_email, compartir_drive, listar_drive
-from sheets import leer_sheet, escribir_sheet
+from sheets import explorar_sheet, escribir_en_sheet, escribir_sheet, leer_sheet
 from docs import crear_documento, listar_documentos
 from calendar_module import crear_evento, listar_eventos
 
@@ -114,14 +115,16 @@ def detectar_intencion(texto: str) -> str:
     palabras_redactar = ["redacta", "escribe un correo", "prepara un mail", "manda un correo",
                          "envia un correo", "correo para", "mail para", "email para", "escribele"]
     palabras_enviar = ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "manda el correo", "dale envia"]
-    palabras_drive = ["carpeta", "folder", "drive", "comparte", "compartir", "acceso a", "dar acceso",
+    palabras_drive = ["carpeta", "folder", "comparte", "compartir", "acceso a", "dar acceso",
                       "archivos de drive", "mis carpetas", "mis archivos"]
     palabras_sheet = ["sheets", "hoja", "spreadsheet", "tabla", "excel", "registro", "agrega a la hoja",
-                      "guarda en sheets", "anota en la tabla", "actualiza la hoja", "gasto", "ingreso",
-                      "agrega que", "registra que", "anota que", "agrega el gasto", "registra el gasto",
-                      "finanzas", "hoja de finanzas"]
-    palabras_doc = ["documento", "contrato", "cotizacion", "crea un doc", "genera un contrato",
-                    "redacta un contrato", "prepara la cotizacion", "genera una cotizacion"]
+                      "guarda en sheets", "anota", "actualiza la hoja", "gasto", "ingreso",
+                      "agrega que", "registra que", "registra", "anota que", "agrega el gasto",
+                      "registra el gasto", "finanzas", "hoja de finanzas", "gastos", "egresos",
+                      "ingresos", "cotizacion", "factura", "cliente nuevo"]
+    palabras_doc = ["documento", "contrato", "crea un doc", "genera un contrato",
+                    "redacta un contrato", "prepara la cotizacion", "genera una cotizacion",
+                    "carta", "propuesta"]
     palabras_calendar = ["calendario", "agenda", "evento", "cita", "reunion", "agendar", "programa",
                          "recordatorio", "que tengo", "que hay esta", "proximos eventos", "esta semana",
                          "invita", "invitar", "crear evento", "nuevo evento", "cuando tengo", "mis eventos",
@@ -175,6 +178,118 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logging.error(f"Error Claude: {e}")
         await update.message.reply_text("Algo fallo. Intenta de nuevo.")
+
+
+async def handle_sheets(update: Update, context, user_text: str):
+    """
+    Manejo inteligente de Google Sheets.
+    1. Si hay un link en el mensaje, explora la estructura del sheet y la guarda.
+    2. Usa Claude para entender que datos registrar y en que pestana.
+    3. Escribe en la fila correcta automaticamente.
+    """
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Extraer ID del sheet si hay un link
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", user_text)
+    if match:
+        sheet_id = match.group(1)
+        guardar_config("sheet_activo_id", sheet_id)
+
+        # Explorar y guardar estructura
+        try:
+            estructura = explorar_sheet(sheet_id)
+            guardar_config("sheet_activo_estructura", json.dumps(estructura, ensure_ascii=False))
+            await update.message.reply_text(
+                f"Sheet conectado: {estructura['titulo']}\n"
+                f"Pestanas: {', '.join([p['nombre'] for p in estructura['pestanas']])}\n\n"
+                "Ahora puedes pedirme que registre datos naturalmente."
+            )
+        except Exception as e:
+            await update.message.reply_text(f"No pude leer el sheet: {e}")
+        return
+    else:
+        sheet_id = leer_config("sheet_activo_id")
+
+    if not sheet_id:
+        await update.message.reply_text("Mandame el link de tu Google Sheet.")
+        return
+
+    # Cargar estructura guardada
+    estructura_raw = leer_config("sheet_activo_estructura")
+    if not estructura_raw:
+        try:
+            estructura = explorar_sheet(sheet_id)
+            guardar_config("sheet_activo_estructura", json.dumps(estructura, ensure_ascii=False))
+        except Exception as e:
+            await update.message.reply_text(f"No pude leer el sheet: {e}")
+            return
+    else:
+        estructura = json.loads(estructura_raw)
+
+    # Usar Claude para decidir que datos registrar y en que pestana
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    estructura_resumida = json.dumps({
+        "titulo": estructura["titulo"],
+        "pestanas": [{"nombre": p["nombre"], "headers": p["headers"]} for p in estructura["pestanas"]]
+    }, ensure_ascii=False)
+
+    prompt = f"""Eres un asistente de finanzas. El usuario quiere registrar datos en Google Sheets.
+
+ESTRUCTURA DEL SHEET:
+{estructura_resumida}
+
+MENSAJE DEL USUARIO: {user_text}
+FECHA DE HOY: {hoy}
+
+Analiza el mensaje y decide:
+1. En que pestana va el registro (elige la mas apropiada segun el nombre y los headers)
+2. Que valores corresponden a cada header de esa pestana
+
+Responde SOLO con un JSON valido, sin texto adicional, sin backticks:
+{{
+  "pestana": "nombre exacto de la pestana",
+  "datos": {{
+    "header1": "valor1",
+    "header2": "valor2"
+  }}
+}}"""
+
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        resultado_raw = response.content[0].text.strip()
+
+        # Limpiar posibles backticks
+        resultado_raw = resultado_raw.replace("```json", "").replace("```", "").strip()
+        resultado = json.loads(resultado_raw)
+
+        pestana_nombre = resultado.get("pestana", "")
+        datos = resultado.get("datos", {})
+
+        # Buscar headers de esa pestana
+        pestana_info = next((p for p in estructura["pestanas"] if p["nombre"] == pestana_nombre), None)
+        if not pestana_info:
+            await update.message.reply_text(f"No encontre la pestana '{pestana_nombre}'. Pestanas disponibles: {', '.join([p['nombre'] for p in estructura['pestanas']])}")
+            return
+
+        headers = pestana_info["headers"]
+
+        # Escribir en el sheet
+        fila_escrita = escribir_en_sheet(sheet_id, pestana_nombre, datos, headers)
+
+        # Confirmar con resumen
+        resumen = " | ".join([f"{k}: {v}" for k, v in datos.items() if v])
+        await update.message.reply_text(f"Registrado en {pestana_nombre} (fila {fila_escrita}):\n{resumen}")
+
+    except json.JSONDecodeError as e:
+        logging.error(f"Error JSON sheets: {e} - Raw: {resultado_raw}")
+        await update.message.reply_text("No pude interpretar los datos. Dame mas detalle: fecha, categoria, concepto, monto y tipo.")
+    except Exception as e:
+        logging.error(f"Error escribiendo sheet: {e}")
+        await update.message.reply_text(f"Error al escribir en el sheet: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,7 +385,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intencion == "leer_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            prompt_busqueda = f"El usuario pregunta: {user_text}\n\nExtrae el termino de busqueda para Gmail. Si menciona una persona o empresa, devuelve 'from:nombre' o el nombre. Si pregunta por un tema, devuelve el tema. Si solo quiere ver todos, devuelve 'in:inbox'. Solo el termino."
+            prompt_busqueda = f"El usuario pregunta: {user_text}\n\nExtrae el termino de busqueda para Gmail. Si menciona una persona, devuelve 'from:nombre'. Si pregunta por tema, devuelve el tema. Si quiere todos, devuelve 'in:inbox'. Solo el termino."
             r = claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=50,
@@ -320,77 +435,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if para and asunto and cuerpo:
             email_draft[chat_id] = {"to": para, "subject": asunto, "body": cuerpo}
             await update.message.reply_text(
-                f"Borrador listo:\n\nPara: {para}\nAsunto: {asunto}\n\n{cuerpo}\n\nDime 'envialo' o ajusta lo que necesites."
+                f"Borrador listo:\n\nPara: {para}\nAsunto: {asunto}\n\n{cuerpo}\n\nDime 'envialo' o ajusta."
             )
         else:
             await update.message.reply_text(resultado)
 
     elif intencion == "sheets":
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-        # Extraer ID del sheet si hay un link en el mensaje
-        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", user_text)
-        if match:
-            sheet_id = match.group(1)
-            guardar_config("sheet_finanzas_id", sheet_id)
-        else:
-            sheet_id = leer_config("sheet_finanzas_id")
-
-        if not sheet_id:
-            await update.message.reply_text("Mandame el link de tu hoja de Google Sheets.")
-            return
-
-        # Extraer datos con Claude
-        hoy = datetime.now().strftime("%d/%m/%Y")
-        mes_actual = datetime.now().strftime("%B").capitalize()
-        meses_es = {"January": "Enero", "February": "Febrero", "March": "Marzo", "April": "Abril",
-                    "May": "Mayo", "June": "Junio", "July": "Julio", "August": "Agosto",
-                    "September": "Septiembre", "October": "Octubre", "November": "Noviembre", "December": "Diciembre"}
-        mes_actual = meses_es.get(mes_actual, mes_actual)
-
-        prompt = f"""El usuario quiere registrar datos en Google Sheets. Mensaje: {user_text}
-
-Hoy es {hoy}. El mes actual es {mes_actual}.
-Extrae los datos y responde en este formato exacto (sin texto adicional):
-PESTANA: {mes_actual}
-FECHA: {hoy}
-CATEGORIA: [categoria del gasto o ingreso]
-DESCRIPCION: [descripcion]
-MONTO: [numero con signo negativo si es gasto, positivo si es ingreso]
-METODO: [Efectivo, Tarjeta, Transferencia, etc]"""
-
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        resultado = response.content[0].text
-        datos = {}
-        for linea in resultado.split('\n'):
-            for campo in ["PESTANA", "FECHA", "CATEGORIA", "DESCRIPCION", "MONTO", "METODO"]:
-                if linea.startswith(f"{campo}:"):
-                    datos[campo] = linea.replace(f"{campo}:", "").strip()
-
-        if "FECHA" in datos and "CATEGORIA" in datos:
-            pestana = datos.get("PESTANA", mes_actual)
-            fila = [
-                datos.get("FECHA", hoy),
-                datos.get("CATEGORIA", ""),
-                datos.get("DESCRIPCION", ""),
-                datos.get("MONTO", ""),
-                datos.get("METODO", "")
-            ]
-            try:
-                escribir_sheet(sheet_id, f"{pestana}!A:E", [fila])
-                await update.message.reply_text(
-                    f"Registrado en {pestana}:\n"
-                    f"{fila[0]} | {fila[1]} | {fila[2]} | {fila[3]} | {fila[4]}"
-                )
-            except Exception as e:
-                logging.error(f"Error Sheets: {e}")
-                await update.message.reply_text(f"Error al escribir en Sheets: {e}")
-        else:
-            await update.message.reply_text("No pude extraer los datos. Dame fecha, categoria, descripcion, monto y metodo.")
+        await handle_sheets(update, context, user_text)
 
     elif intencion == "drive":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -415,18 +466,13 @@ METODO: [Efectivo, Tarjeta, Transferencia, etc]"""
                         email_dest = linea.replace("EMAIL:", "").strip()
                     elif linea.startswith("ROL:"):
                         rol = linea.replace("ROL:", "").strip().lower()
-
                 archivo_encontrado = next((a for a in archivos if nombre_archivo.lower() in a['name'].lower()), None)
                 if archivo_encontrado and email_dest:
                     url = compartir_drive(archivo_encontrado['id'], email_dest, rol)
-                    await update.message.reply_text(
-                        f"'{archivo_encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}"
-                    )
+                    await update.message.reply_text(f"'{archivo_encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}")
                 else:
                     lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
-                    await update.message.reply_text(
-                        f"No encontre '{nombre_archivo}' en tu Drive. Archivos disponibles:\n\n{lista}\n\nDime el nombre exacto y el email."
-                    )
+                    await update.message.reply_text(f"No encontre '{nombre_archivo}'. Archivos disponibles:\n\n{lista}")
             else:
                 archivos = listar_drive(max_results=10)
                 lista = "\n".join([f"- {a['name']}" for a in archivos])
@@ -461,7 +507,6 @@ METODO: [Efectivo, Tarjeta, Transferencia, etc]"""
                     for campo in ["TITULO", "INICIO", "FIN", "DESCRIPCION", "INVITADOS", "RECORDATORIO"]:
                         if linea.startswith(f"{campo}:"):
                             datos[campo] = linea.replace(f"{campo}:", "").strip()
-
                 if "TITULO" in datos and "INICIO" in datos and "FIN" in datos:
                     invitados = [e.strip() for e in datos.get("INVITADOS", "").split(",") if "@" in e]
                     recordatorio = int(datos.get("RECORDATORIO", "30"))
@@ -607,5 +652,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Gmail, Sheets, Docs, Calendar y Drive activos...")
+    print("Cortana en linea - Gmail, Sheets inteligente, Docs, Calendar y Drive activos...")
     app.run_polling()
