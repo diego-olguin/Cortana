@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import logging
 from datetime import datetime
@@ -7,7 +8,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 import anthropic
 import httpx
 from system_prompt import get_system_prompt
-from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje
+from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje, guardar_config, leer_config
 from gmail import leer_emails_no_leidos, buscar_emails, enviar_email, compartir_drive, listar_drive
 from sheets import leer_sheet, escribir_sheet
 from docs import crear_documento, listar_documentos
@@ -36,12 +37,12 @@ async def consultar_gemini(respuesta_claude: str) -> str:
 {respuesta_claude}
 
 Tu trabajo: decide si tienes algo CONCRETO y VALIOSO que agregar. Criterios estrictos:
-- Solo habla si puedes agregar un dato, perspectiva o advertencia que Cortana NO mencionó y que cambia algo.
-- Si Cortana cubrió bien el tema, responde exactamente: [SILENCIO]
-- Si tienes algo que agregar, escribe UN párrafo completo y directo. Sin introducción, sin referirte a Cortana.
-- Nunca dejes una oración incompleta. Si empiezas una idea, termínala.
+- Solo habla si puedes agregar un dato, perspectiva o advertencia que Cortana NO menciono y que cambia algo.
+- Si Cortana cubrio bien el tema, responde exactamente: [SILENCIO]
+- Si tienes algo que agregar, escribe UN parrafo completo y directo. Sin introduccion, sin referirte a Cortana.
+- Nunca dejes una oracion incompleta.
 
-¿Tienes algo concreto que agregar?"""
+Tienes algo concreto que agregar?"""
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -116,7 +117,9 @@ def detectar_intencion(texto: str) -> str:
     palabras_drive = ["carpeta", "folder", "drive", "comparte", "compartir", "acceso a", "dar acceso",
                       "archivos de drive", "mis carpetas", "mis archivos"]
     palabras_sheet = ["sheets", "hoja", "spreadsheet", "tabla", "excel", "registro", "agrega a la hoja",
-                      "guarda en sheets", "anota en la tabla", "actualiza la hoja"]
+                      "guarda en sheets", "anota en la tabla", "actualiza la hoja", "gasto", "ingreso",
+                      "agrega que", "registra que", "anota que", "agrega el gasto", "registra el gasto",
+                      "finanzas", "hoja de finanzas"]
     palabras_doc = ["documento", "contrato", "cotizacion", "crea un doc", "genera un contrato",
                     "redacta un contrato", "prepara la cotizacion", "genera una cotizacion"]
     palabras_calendar = ["calendario", "agenda", "evento", "cita", "reunion", "agendar", "programa",
@@ -267,29 +270,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intencion == "leer_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            # Extraer término de búsqueda si menciona a alguien
-            prompt_busqueda = f"El usuario pregunta: {user_text}\n\nExtrae el termino de busqueda para Gmail. Si menciona una persona o empresa, devuelve 'from:nombre' o el nombre. Si pregunta por un tema, devuelve el tema. Si solo quiere ver todos los correos, devuelve 'in:inbox'. Solo devuelve el termino, sin explicacion."
+            prompt_busqueda = f"El usuario pregunta: {user_text}\n\nExtrae el termino de busqueda para Gmail. Si menciona una persona o empresa, devuelve 'from:nombre' o el nombre. Si pregunta por un tema, devuelve el tema. Si solo quiere ver todos, devuelve 'in:inbox'. Solo el termino."
             r = claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=50,
                 messages=[{"role": "user", "content": prompt_busqueda}]
             )
             query = r.content[0].text.strip()
-
             emails = buscar_emails(query, max_results=5)
             if not emails:
-                # Intentar con correos no leídos como fallback
                 emails = leer_emails_no_leidos(5)
-
             if not emails:
-                contexto = f"[DATOS: Gmail revisado. No se encontraron correos con la busqueda '{query}'.]\n\nMensaje de Diego: {user_text}"
+                contexto = f"[DATOS: Gmail revisado. No se encontraron correos.]\n\nMensaje de Diego: {user_text}"
             else:
                 resumen = "\n".join([
                     f"- {'[NO LEIDO] ' if not e['leido'] else ''}De: {e['from']} | Asunto: {e['subject']} | {e['date'][:16]} | {e['snippet'][:100]}"
                     for e in emails
                 ])
-                contexto = f"[DATOS: Gmail revisado. Correos encontrados (busqueda: {query}):\n{resumen}]\n\nMensaje de Diego: {user_text}"
-
+                contexto = f"[DATOS: Gmail revisado. Correos encontrados:\n{resumen}]\n\nMensaje de Diego: {user_text}"
             await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
         except Exception as e:
             logging.error(f"Error Gmail: {e}")
@@ -297,7 +295,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif intencion == "redactar_mail":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        prompt = f"El usuario quiere redactar un correo. Mensaje: {user_text}\n\nExtrae destinatario, asunto y redacta el cuerpo profesional firmado como Diego Olguin de Eclipse Estudio. Formato exacto:\nPARA: email@destino.com\nASUNTO: asunto\nCUERPO:\n[cuerpo]"
+        prompt = f"El usuario quiere redactar un correo. Mensaje: {user_text}\n\nExtrae destinatario, asunto y redacta el cuerpo profesional firmado como Diego Olguin de Eclipse Estudio. Formato:\nPARA: email@destino.com\nASUNTO: asunto\nCUERPO:\n[cuerpo]"
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
@@ -319,7 +317,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif en_cuerpo:
                 cuerpo_lines.append(linea)
         cuerpo = "\n".join(cuerpo_lines).strip()
-
         if para and asunto and cuerpo:
             email_draft[chat_id] = {"to": para, "subject": asunto, "body": cuerpo}
             await update.message.reply_text(
@@ -328,20 +325,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(resultado)
 
+    elif intencion == "sheets":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+        # Extraer ID del sheet si hay un link en el mensaje
+        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", user_text)
+        if match:
+            sheet_id = match.group(1)
+            guardar_config("sheet_finanzas_id", sheet_id)
+        else:
+            sheet_id = leer_config("sheet_finanzas_id")
+
+        if not sheet_id:
+            await update.message.reply_text("Mandame el link de tu hoja de Google Sheets.")
+            return
+
+        # Extraer datos con Claude
+        hoy = datetime.now().strftime("%d/%m/%Y")
+        mes_actual = datetime.now().strftime("%B").capitalize()
+        meses_es = {"January": "Enero", "February": "Febrero", "March": "Marzo", "April": "Abril",
+                    "May": "Mayo", "June": "Junio", "July": "Julio", "August": "Agosto",
+                    "September": "Septiembre", "October": "Octubre", "November": "Noviembre", "December": "Diciembre"}
+        mes_actual = meses_es.get(mes_actual, mes_actual)
+
+        prompt = f"""El usuario quiere registrar datos en Google Sheets. Mensaje: {user_text}
+
+Hoy es {hoy}. El mes actual es {mes_actual}.
+Extrae los datos y responde en este formato exacto (sin texto adicional):
+PESTANA: {mes_actual}
+FECHA: {hoy}
+CATEGORIA: [categoria del gasto o ingreso]
+DESCRIPCION: [descripcion]
+MONTO: [numero con signo negativo si es gasto, positivo si es ingreso]
+METODO: [Efectivo, Tarjeta, Transferencia, etc]"""
+
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        resultado = response.content[0].text
+        datos = {}
+        for linea in resultado.split('\n'):
+            for campo in ["PESTANA", "FECHA", "CATEGORIA", "DESCRIPCION", "MONTO", "METODO"]:
+                if linea.startswith(f"{campo}:"):
+                    datos[campo] = linea.replace(f"{campo}:", "").strip()
+
+        if "FECHA" in datos and "CATEGORIA" in datos:
+            pestana = datos.get("PESTANA", mes_actual)
+            fila = [
+                datos.get("FECHA", hoy),
+                datos.get("CATEGORIA", ""),
+                datos.get("DESCRIPCION", ""),
+                datos.get("MONTO", ""),
+                datos.get("METODO", "")
+            ]
+            try:
+                escribir_sheet(sheet_id, f"{pestana}!A:E", [fila])
+                await update.message.reply_text(
+                    f"Registrado en {pestana}:\n"
+                    f"{fila[0]} | {fila[1]} | {fila[2]} | {fila[3]} | {fila[4]}"
+                )
+            except Exception as e:
+                logging.error(f"Error Sheets: {e}")
+                await update.message.reply_text(f"Error al escribir en Sheets: {e}")
+        else:
+            await update.message.reply_text("No pude extraer los datos. Dame fecha, categoria, descripcion, monto y metodo.")
+
     elif intencion == "drive":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
             texto_lower = user_text.lower()
             if any(p in texto_lower for p in ["comparte", "compartir", "dar acceso", "acceso a"]):
-                # Extraer datos para compartir
-                prompt = f"El usuario quiere compartir algo de Drive. Mensaje: {user_text}\n\nExtrae:\nARCHIVO: nombre del archivo o carpeta\nEMAIL: email de la persona\nROL: reader, commenter o writer\n\nSolo devuelve esos tres campos."
+                prompt = f"El usuario quiere compartir algo de Drive. Mensaje: {user_text}\n\nExtrae:\nARCHIVO: nombre\nEMAIL: email\nROL: reader, commenter o writer"
                 r = claude.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=100,
                     messages=[{"role": "user", "content": prompt}]
                 )
                 datos_raw = r.content[0].text
-                # Buscar el archivo en Drive
                 archivos = listar_drive(max_results=20)
                 nombre_archivo = ""
                 email_dest = ""
@@ -355,27 +417,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         rol = linea.replace("ROL:", "").strip().lower()
 
                 archivo_encontrado = next((a for a in archivos if nombre_archivo.lower() in a['name'].lower()), None)
-
                 if archivo_encontrado and email_dest:
                     url = compartir_drive(archivo_encontrado['id'], email_dest, rol)
                     await update.message.reply_text(
-                        f"Carpeta '{archivo_encontrado['name']}' compartida con {email_dest} como {rol}.\n{url}"
+                        f"'{archivo_encontrado['name']}' compartido con {email_dest} como {rol}.\n{url}"
                     )
                 else:
-                    # Mostrar lista de archivos disponibles
                     lista = "\n".join([f"- {a['name']}" for a in archivos[:10]])
                     await update.message.reply_text(
-                        f"No encontre '{nombre_archivo}' en tu Drive. Tus archivos recientes:\n\n{lista}\n\nDime el nombre exacto y el email de quien va a recibir acceso."
+                        f"No encontre '{nombre_archivo}' en tu Drive. Archivos disponibles:\n\n{lista}\n\nDime el nombre exacto y el email."
                     )
             else:
-                # Listar archivos
                 archivos = listar_drive(max_results=10)
-                if not archivos:
-                    await update.message.reply_text("No encontre archivos en tu Drive.")
-                else:
-                    lista = "\n".join([f"- {a['name']} ({a['mimeType'].split('.')[-1]})" for a in archivos])
-                    contexto = f"[DATOS: Drive revisado. Archivos recientes:\n{lista}]\n\nMensaje de Diego: {user_text}"
-                    await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
+                lista = "\n".join([f"- {a['name']}" for a in archivos])
+                contexto = f"[DATOS: Drive revisado. Archivos recientes:\n{lista}]\n\nMensaje de Diego: {user_text}"
+                await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
         except Exception as e:
             logging.error(f"Error Drive: {e}")
             await update.message.reply_text(f"Error con Drive: {e}")
@@ -400,9 +456,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     max_tokens=300,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                resultado = response.content[0].text
                 datos = {}
-                for linea in resultado.split('\n'):
+                for linea in response.content[0].text.split('\n'):
                     for campo in ["TITULO", "INICIO", "FIN", "DESCRIPCION", "INVITADOS", "RECORDATORIO"]:
                         if linea.startswith(f"{campo}:"):
                             datos[campo] = linea.replace(f"{campo}:", "").strip()
@@ -422,14 +477,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Error Calendar: {e}")
             await update.message.reply_text(f"Error con Calendar: {e}")
-
-    elif intencion == "sheets":
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        await responder_con_claude(
-            update, context,
-            [{"role": "user", "content": f"[DATOS: El usuario quiere trabajar con Google Sheets. Necesita compartir el link del spreadsheet.]\n\nMensaje de Diego: {user_text}"}],
-            user_text
-        )
 
     elif intencion == "docs":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
