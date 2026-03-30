@@ -7,6 +7,7 @@ import anthropic
 import httpx
 from system_prompt import get_system_prompt
 from db import init_db, cargar_memoria, agregar_hecho, borrar_hecho, formatear_memoria, cargar_historial, guardar_mensaje
+from gmail import leer_emails_no_leidos, enviar_email
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -21,6 +22,9 @@ logging.basicConfig(level=logging.INFO)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 init_db()
+
+# Estado temporal para borradores de email
+email_draft = {}
 
 
 async def consultar_gemini(pregunta_original: str, respuesta_claude: str) -> str:
@@ -119,11 +123,14 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Cortana en linea.\n\n"
-        "Estoy aqui, Diego.\n\n"
-        "/recuerda [hecho] — Guardo algo permanentemente\n"
-        "/memoria — Te muestro todo lo que recuerdo\n"
-        "/olvida [numero] — Borro un hecho especifico\n"
-        "/reset — Limpio la conversacion activa"
+        "Comandos:\n"
+        "/recuerda [hecho] — Memoria permanente\n"
+        "/memoria — Ver memoria\n"
+        "/olvida [numero] — Borrar hecho\n"
+        "/reset — Limpiar conversacion\n"
+        "/mails — Ver correos no leidos\n"
+        "/redactar [para] [asunto] — Redactar correo\n"
+        "/enviar — Enviar borrador aprobado"
     )
 
 
@@ -174,8 +181,95 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Conversacion reiniciada. Memoria permanente intacta.")
 
 
+# ── GMAIL ──
+
+async def ver_mails(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        emails = leer_emails_no_leidos(5)
+        if not emails:
+            await update.message.reply_text("No tienes correos no leidos.")
+            return
+        texto = "Correos no leidos:\n\n"
+        for i, email in enumerate(emails, 1):
+            texto += f"{i}. De: {email['from']}\n   Asunto: {email['subject']}\n   {email['snippet'][:100]}...\n\n"
+        await update.message.reply_text(texto)
+    except Exception as e:
+        logging.error(f"Error leyendo mails: {e}")
+        await update.message.reply_text("Error al leer correos.")
+
+
+async def redactar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /redactar correo@destino Asunto del correo")
+        return
+
+    destinatario = context.args[0]
+    asunto = " ".join(context.args[1:])
+    chat_id = update.effective_chat.id
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    prompt = f"Redacta un correo profesional para {destinatario} con el asunto: {asunto}. Firma como Diego Olguin de Eclipse Estudio. Solo el cuerpo del correo, sin comentarios adicionales."
+
+    response = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    borrador = response.content[0].text
+
+    email_draft[chat_id] = {
+        "to": destinatario,
+        "subject": asunto,
+        "body": borrador
+    }
+
+    await update.message.reply_text(
+        f"Borrador listo:\n\nPara: {destinatario}\nAsunto: {asunto}\n\n{borrador}\n\n"
+        "Si quieres enviarlo escribe /enviar\n"
+        "Si quieres modificarlo dime que cambiar y lo corrijo."
+    )
+
+
+async def enviar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in email_draft:
+        await update.message.reply_text("No hay borrador pendiente. Usa /redactar primero.")
+        return
+
+    draft = email_draft[chat_id]
+    try:
+        enviar_email(draft["to"], draft["subject"], draft["body"])
+        del email_draft[chat_id]
+        await update.message.reply_text(f"Correo enviado a {draft['to']}.")
+    except Exception as e:
+        logging.error(f"Error enviando mail: {e}")
+        await update.message.reply_text("Error al enviar. Revisa la conexion con Gmail.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user_text = update.message.text
+
+    # Si hay borrador activo, permite modificarlo
+    if chat_id in email_draft:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        draft = email_draft[chat_id]
+        prompt = f"Este es el borrador actual:\n\n{draft['body']}\n\nEl usuario pide este cambio: {user_text}\n\nDevuelve solo el cuerpo del correo corregido."
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        nuevo_borrador = response.content[0].text
+        email_draft[chat_id]["body"] = nuevo_borrador
+        await update.message.reply_text(
+            f"Borrador actualizado:\n\n{nuevo_borrador}\n\n"
+            "Escribe /enviar para mandarlo o sigue ajustando."
+        )
+        return
+
     await responder_con_claude(
         update, context,
         messages_payload=[{"role": "user", "content": user_text}],
@@ -294,6 +388,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("memoria", ver_memoria))
     app.add_handler(CommandHandler("olvida", olvida))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("mails", ver_mails))
+    app.add_handler(CommandHandler("redactar", redactar))
+    app.add_handler(CommandHandler("enviar", enviar))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -302,5 +399,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - multimedia activo...")
+    print("Cortana en linea - Gmail activo...")
     app.run_polling()
