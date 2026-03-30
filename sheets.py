@@ -17,21 +17,14 @@ CATEGORIAS_VALIDAS = [
     "DEUDAS", "Dates", "Inversiones", "Comidas fuera", "Marihuana", "MUNCHIES"
 ]
 
-# Rangos fijos del sheet
 EGRESOS_FILA_INICIO = 3
 EGRESOS_FILA_FIN = 264
 
 INGRESOS_EXTRA_FILA_INICIO = 26
 INGRESOS_EXTRA_FILA_FIN = 51
-INGRESOS_EXTRA_COL_DESC = "G"
-INGRESOS_EXTRA_COL_DEBEN = "H"
-INGRESOS_EXTRA_COL_PAGADO = "I"
 
 INGRESOS_FIJOS_FILA_INICIO = 5
 INGRESOS_FIJOS_FILA_FIN = 24
-INGRESOS_FIJOS_COL_DESC = "G"
-INGRESOS_FIJOS_COL_DEBEN = "H"
-INGRESOS_FIJOS_COL_PAGADO = "I"
 
 
 def get_sheets_service():
@@ -51,38 +44,69 @@ def normalizar_categoria(categoria_input: str) -> str:
     return "OTRO"
 
 
-def encontrar_siguiente_fila_vacia(service, spreadsheet_id: str, pestana: str,
-                                   columna: str, fila_inicio: int, fila_fin: int) -> int:
+def encontrar_siguiente_fila_egreso(service, spreadsheet_id: str, pestana: str) -> int:
     """
-    Busca la primera fila vacia en el rango especificado.
-    Devuelve numero de fila (1-indexed).
+    Busca la ULTIMA fila con dato en la columna B dentro del rango B3:B264.
+    Escribe en la fila siguiente a esa (orden cronologico hacia abajo).
     """
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{pestana}!{columna}{fila_inicio}:{columna}{fila_fin}"
+        range=f"{pestana}!B{EGRESOS_FILA_INICIO}:B{EGRESOS_FILA_FIN}"
     ).execute()
     valores = result.get("values", [])
 
+    ultima_fila_con_dato = None
     for i, fila in enumerate(valores):
-        if not fila or not str(fila[0]).strip():
-            return fila_inicio + i
+        if fila and str(fila[0]).strip():
+            ultima_fila_con_dato = EGRESOS_FILA_INICIO + i
 
-    raise ValueError(f"No hay espacio disponible en el rango ({columna}{fila_inicio}:{columna}{fila_fin}).")
+    if ultima_fila_con_dato is None:
+        # No hay datos aun, empezar desde el inicio del rango
+        return EGRESOS_FILA_INICIO
+
+    siguiente = ultima_fila_con_dato + 1
+    if siguiente > EGRESOS_FILA_FIN:
+        raise ValueError(f"No hay espacio en el rango de egresos (A{EGRESOS_FILA_INICIO}:E{EGRESOS_FILA_FIN}).")
+
+    return siguiente
+
+
+def encontrar_siguiente_fila_ingreso(service, spreadsheet_id: str, pestana: str,
+                                      fila_inicio: int, fila_fin: int) -> int:
+    """
+    Busca la ULTIMA fila con dato en la columna G dentro del rango dado.
+    Escribe en la siguiente fila.
+    """
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{pestana}!G{fila_inicio}:G{fila_fin}"
+    ).execute()
+    valores = result.get("values", [])
+
+    ultima_fila_con_dato = None
+    for i, fila in enumerate(valores):
+        if fila and str(fila[0]).strip():
+            ultima_fila_con_dato = fila_inicio + i
+
+    if ultima_fila_con_dato is None:
+        return fila_inicio
+
+    siguiente = ultima_fila_con_dato + 1
+    if siguiente > fila_fin:
+        raise ValueError(f"No hay espacio en el rango de ingresos (G{fila_inicio}:I{fila_fin}).")
+
+    return siguiente
 
 
 def registrar_egreso(spreadsheet_id: str, pestana: str, categoria: str, descripcion: str,
                      importe: float, fecha: str, metodo: str) -> int:
     """
-    Registra un gasto en A3:E264 en orden cronologico.
+    Registra un gasto en A3:E264 despues del ultimo dato existente.
     A=CATEGORIA, B=DESCRIPCION, C=IMPORTE, D=FECHA, E=METODO
     """
     service = get_sheets_service()
     categoria_valida = normalizar_categoria(categoria)
-
-    fila = encontrar_siguiente_fila_vacia(
-        service, spreadsheet_id, pestana,
-        "B", EGRESOS_FILA_INICIO, EGRESOS_FILA_FIN
-    )
+    fila = encontrar_siguiente_fila_egreso(service, spreadsheet_id, pestana)
 
     rango = f"{pestana}!A{fila}:E{fila}"
     valores = [[categoria_valida, descripcion, importe, fecha, metodo]]
@@ -92,7 +116,6 @@ def registrar_egreso(spreadsheet_id: str, pestana: str, categoria: str, descripc
         valueInputOption="USER_ENTERED",
         body={"values": valores}
     ).execute()
-
     return fila
 
 
@@ -100,18 +123,14 @@ def registrar_ingreso_extra(spreadsheet_id: str, pestana: str, descripcion: str,
                              monto_deben: float, monto_pagado: float) -> int:
     """
     Registra un ingreso freelance en G26:I51.
-    G=Descripcion, H=Deben (pendiente por cobrar), I=Pagado (ya cobrado)
+    G=Descripcion, H=Deben, I=Pagado
     """
     service = get_sheets_service()
-
-    fila = encontrar_siguiente_fila_vacia(
+    fila = encontrar_siguiente_fila_ingreso(
         service, spreadsheet_id, pestana,
-        INGRESOS_EXTRA_COL_DESC,
-        INGRESOS_EXTRA_FILA_INICIO,
-        INGRESOS_EXTRA_FILA_FIN
+        INGRESOS_EXTRA_FILA_INICIO, INGRESOS_EXTRA_FILA_FIN
     )
-
-    rango = f"{pestana}!{INGRESOS_EXTRA_COL_DESC}{fila}:{INGRESOS_EXTRA_COL_PAGADO}{fila}"
+    rango = f"{pestana}!G{fila}:I{fila}"
     valores = [[descripcion, monto_deben if monto_deben else "", monto_pagado if monto_pagado else ""]]
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -119,26 +138,21 @@ def registrar_ingreso_extra(spreadsheet_id: str, pestana: str, descripcion: str,
         valueInputOption="USER_ENTERED",
         body={"values": valores}
     ).execute()
-
     return fila
 
 
 def registrar_ingreso_fijo(spreadsheet_id: str, pestana: str, descripcion: str,
                             monto_deben: float, monto_pagado: float) -> int:
     """
-    Registra un ingreso fijo (cliente recurrente) en G5:I24.
+    Registra un ingreso fijo en G5:I24.
     G=Descripcion, H=Deben, I=Pagado
     """
     service = get_sheets_service()
-
-    fila = encontrar_siguiente_fila_vacia(
+    fila = encontrar_siguiente_fila_ingreso(
         service, spreadsheet_id, pestana,
-        INGRESOS_FIJOS_COL_DESC,
-        INGRESOS_FIJOS_FILA_INICIO,
-        INGRESOS_FIJOS_FILA_FIN
+        INGRESOS_FIJOS_FILA_INICIO, INGRESOS_FIJOS_FILA_FIN
     )
-
-    rango = f"{pestana}!{INGRESOS_FIJOS_COL_DESC}{fila}:{INGRESOS_FIJOS_COL_PAGADO}{fila}"
+    rango = f"{pestana}!G{fila}:I{fila}"
     valores = [[descripcion, monto_deben if monto_deben else "", monto_pagado if monto_pagado else ""]]
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -146,7 +160,6 @@ def registrar_ingreso_fijo(spreadsheet_id: str, pestana: str, descripcion: str,
         valueInputOption="USER_ENTERED",
         body={"values": valores}
     ).execute()
-
     return fila
 
 
