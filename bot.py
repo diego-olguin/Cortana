@@ -30,24 +30,42 @@ init_db()
 email_draft = {}
 
 
-async def consultar_gemini(pregunta_original: str, respuesta_claude: str) -> str:
-    prompt = f"""Eres un consejero inteligente. Claude ya respondio una pregunta.
-1. Si la respuesta es completa responde SOLO: [SIN_ADICION]
-2. Si hay algo que agregar responde con UN parrafo corto y directo.
-No repitas lo que dijo Claude. Responde en espanol.
+async def consultar_gemini(respuesta_claude: str) -> str:
+    """
+    Gemini solo habla si tiene algo concreto que agregar.
+    Si no, calla. Sin mensajes cortados ni relleno.
+    """
+    prompt = f"""Eres un consejero experto en negocios, video y estrategia digital. Acabas de leer esta respuesta de una IA llamada Cortana:
 
-PREGUNTA: {pregunta_original}
-RESPUESTA DE CLAUDE: {respuesta_claude}"""
+{respuesta_claude}
+
+Tu trabajo: decide si tienes algo CONCRETO y VALIOSO que agregar. Criterios estrictos:
+- Solo habla si puedes agregar un dato, perspectiva o advertencia que Cortana NO mencionó y que cambia algo.
+- Si Cortana cubrió bien el tema, responde exactamente: [SILENCIO]
+- Si tienes algo que agregar, escribe UN párrafo completo y directo. Sin introducción, sin "además", sin referirte a Cortana.
+- Nunca dejes una oración incompleta. Si empiezas una idea, termínala.
+
+¿Tienes algo concreto que agregar?"""
+
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 300, "temperature": 0.7}
+            "generationConfig": {"maxOutputTokens": 200, "temperature": 0.5}
         }
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(url, json=payload)
             texto = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return "" if "[SIN_ADICION]" in texto else texto
+            if "[SILENCIO]" in texto or len(texto) < 20:
+                return ""
+            # Asegura que el texto termine en puntuación completa
+            if texto and texto[-1] not in ".!?":
+                ultimo_punto = max(texto.rfind("."), texto.rfind("!"), texto.rfind("?"))
+                if ultimo_punto > len(texto) // 2:
+                    texto = texto[:ultimo_punto + 1]
+                else:
+                    return ""
+            return texto
     except Exception as e:
         logging.error(f"Error Gemini consejero: {e}")
         return ""
@@ -95,17 +113,19 @@ def detectar_intencion(texto: str) -> str:
 
     palabras_mail = ["correo", "mail", "email", "mensaje", "inbox", "bandeja", "escribio", "mando un mail",
                      "mando correo", "recibiste", "tiene correo", "tengo correo", "no leidos", "sin leer",
-                     "revisa mi correo", "hay correos", "correos nuevos"]
+                     "revisa mi correo", "hay correos", "correos nuevos", "me escribio", "me llego algo",
+                     "alguien me escribio", "noticias de", "saber si"]
     palabras_redactar = ["redacta", "escribe un correo", "prepara un mail", "manda un correo",
-                         "envia un correo", "correo para", "mail para", "email para"]
-    palabras_enviar = ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "manda el correo"]
+                         "envia un correo", "correo para", "mail para", "email para", "escribele"]
+    palabras_enviar = ["envialo", "mandalo", "si envialo", "confirmo", "aprobado", "manda el correo", "dale envia"]
     palabras_sheet = ["sheets", "hoja", "spreadsheet", "tabla", "excel", "registro", "agrega a la hoja",
                       "guarda en sheets", "anota en la tabla", "actualiza la hoja"]
     palabras_doc = ["documento", "contrato", "cotizacion", "doc", "crea un documento", "genera un contrato",
-                    "redacta un contrato", "prepara la cotizacion"]
+                    "redacta un contrato", "prepara la cotizacion", "genera una cotizacion"]
     palabras_calendar = ["calendario", "agenda", "evento", "cita", "reunion", "agendar", "programa",
-                         "recordatorio", "que tengo", "que hay", "proximos eventos", "esta semana",
-                         "invita", "invitar", "crear evento", "nuevo evento"]
+                         "recordatorio", "que tengo", "que hay esta", "proximos eventos", "esta semana",
+                         "invita", "invitar", "crear evento", "nuevo evento", "cuando tengo", "mis eventos",
+                         "tengo algo", "hay algo agendado"]
 
     if any(p in texto_lower for p in palabras_enviar):
         return "enviar_mail"
@@ -123,7 +143,8 @@ def detectar_intencion(texto: str) -> str:
 
 
 async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                messages_payload: list, texto_para_historial: str):
+                                messages_payload: list, texto_para_historial: str,
+                                usar_consejero: bool = True):
     historial = cargar_historial(MAX_HISTORIAL)
     system = get_system_prompt(formatear_memoria())
 
@@ -137,12 +158,13 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
             messages=historial + messages_payload
         )
         respuesta_claude = response.content[0].text
-        adicion_gemini = await consultar_gemini(texto_para_historial, respuesta_claude)
 
-        respuesta_final = (
-            f"{respuesta_claude}\n\n[Consejero] {adicion_gemini}"
-            if adicion_gemini else respuesta_claude
-        )
+        respuesta_final = respuesta_claude
+
+        if usar_consejero:
+            adicion_gemini = await consultar_gemini(respuesta_claude)
+            if adicion_gemini:
+                respuesta_final = f"{respuesta_claude}\n\n{adicion_gemini}"
 
         guardar_mensaje("user", texto_para_historial)
         guardar_mensaje("assistant", respuesta_claude)
@@ -157,11 +179,7 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Cortana en linea.\n\n"
-        "Puedes hablarme naturalmente sobre:\n"
-        "- Correos (leer, redactar, enviar)\n"
-        "- Calendario (ver eventos, crear, invitar)\n"
-        "- Google Sheets\n"
-        "- Google Docs\n\n"
+        "Habla naturalmente. Tengo acceso a tu Gmail, Calendar, Drive y Sheets.\n\n"
         "Comandos:\n"
         "/recuerda [hecho]\n"
         "/memoria\n"
@@ -243,8 +261,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nuevo_borrador = response.content[0].text
             email_draft[chat_id]["body"] = nuevo_borrador
             await update.message.reply_text(
-                f"Borrador actualizado:\n\n{nuevo_borrador}\n\n"
-                "Dime 'envialo' para mandarlo o sigue ajustando."
+                f"Borrador actualizado:\n\n{nuevo_borrador}\n\nDime 'envialo' para mandarlo."
             )
             return
 
@@ -255,11 +272,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             emails = leer_emails_no_leidos(5)
             if not emails:
-                contexto = "El usuario pregunto por sus correos. No hay correos no leidos."
+                contexto = f"[DATOS: Gmail revisado. No hay correos no leidos.]\n\nMensaje de Diego: {user_text}"
             else:
-                resumen = "\n".join([f"- De: {e['from']} | Asunto: {e['subject']} | {e['snippet'][:80]}" for e in emails])
-                contexto = f"El usuario pregunto por sus correos. Correos no leidos:\n{resumen}\n\nResponde de forma natural."
-            await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text)
+                resumen = "\n".join([f"- De: {e['from']} | Asunto: {e['subject']} | {e['snippet'][:100]}" for e in emails])
+                contexto = f"[DATOS: Gmail revisado. Correos no leidos:\n{resumen}]\n\nMensaje de Diego: {user_text}"
+            await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
         except Exception as e:
             logging.error(f"Error Gmail: {e}")
             await update.message.reply_text("No pude acceder a Gmail.")
@@ -301,18 +318,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif intencion == "calendar":
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         try:
-            # Detectar si quiere ver o crear
             texto_lower = user_text.lower()
-            if any(p in texto_lower for p in ["que tengo", "que hay", "proximos", "agenda", "esta semana", "ver"]):
+            if any(p in texto_lower for p in ["que tengo", "que hay", "proximos", "agenda", "semana", "ver", "hay algo", "tengo algo"]):
                 eventos = listar_eventos(7)
                 if not eventos:
-                    contexto = "El usuario pregunto por su calendario. No hay eventos proximos en los siguientes 7 dias."
+                    contexto = f"[DATOS: Google Calendar revisado. No hay eventos en los proximos 7 dias.]\n\nMensaje de Diego: {user_text}"
                 else:
                     resumen = "\n".join([f"- {e['titulo']} | {e['inicio']} | Invitados: {', '.join(e['invitados']) if e['invitados'] else 'ninguno'}" for e in eventos])
-                    contexto = f"El usuario pregunto por su calendario. Proximos eventos:\n{resumen}\n\nResponde de forma natural."
-                await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text)
+                    contexto = f"[DATOS: Google Calendar revisado. Proximos eventos:\n{resumen}]\n\nMensaje de Diego: {user_text}"
+                await responder_con_claude(update, context, [{"role": "user", "content": contexto}], user_text, usar_consejero=False)
             else:
-                # Crear evento — Claude extrae los datos
                 hoy = datetime.now().strftime("%Y-%m-%d")
                 prompt = f"El usuario quiere crear un evento en Google Calendar. Su mensaje: {user_text}\n\nHoy es {hoy}. Extrae los datos y responde en este formato exacto:\nTITULO: nombre del evento\nINICIO: 2026-03-30T10:00:00\nFIN: 2026-03-30T11:00:00\nDESCRIPCION: descripcion opcional\nINVITADOS: email1@ejemplo.com,email2@ejemplo.com\nRECORDATORIO: 30"
                 response = claude.messages.create(
@@ -338,10 +353,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     respuesta = f"Evento creado: {datos['TITULO']}\nInicio: {datos['INICIO']}\nFin: {datos['FIN']}"
                     if invitados:
                         respuesta += f"\nInvitados: {', '.join(invitados)}"
-                    respuesta += f"\n\nVer en Calendar: {url}"
+                    respuesta += f"\n\n{url}"
                     await update.message.reply_text(respuesta)
                 else:
-                    await update.message.reply_text("No pude extraer los datos del evento. Dame mas detalles: titulo, fecha, hora y a quien invitar.")
+                    await update.message.reply_text("Dame mas detalles: titulo, fecha, hora de inicio y fin, y a quien invitar.")
         except Exception as e:
             logging.error(f"Error Calendar: {e}")
             await update.message.reply_text(f"Error con Calendar: {e}")
@@ -350,7 +365,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         await responder_con_claude(
             update, context,
-            [{"role": "user", "content": f"{user_text}\n\n[El usuario quiere trabajar con Google Sheets. Pidele el link del spreadsheet si no lo tienes.]"}],
+            [{"role": "user", "content": f"[DATOS: El usuario quiere trabajar con Google Sheets.]\n\nMensaje de Diego: {user_text}"}],
             user_text
         )
 
@@ -366,7 +381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         titulo = user_text[:50]
         try:
             url = crear_documento(titulo, contenido)
-            await update.message.reply_text(f"Documento creado:\n{url}\n\nContenido:\n{contenido[:500]}...")
+            await update.message.reply_text(f"Documento creado en tu Drive:\n{url}")
         except Exception as e:
             logging.error(f"Error Docs: {e}")
             await update.message.reply_text(f"Error al crear documento: {e}")
@@ -405,11 +420,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude entender el audio.")
         return
     await update.message.reply_text(f"Entendi: {transcripcion}")
-    await responder_con_claude(
-        update, context,
-        messages_payload=[{"role": "user", "content": transcripcion}],
-        texto_para_historial=f"[Audio] {transcripcion}"
-    )
+
+    # También detecta intención en audios
+    intencion = detectar_intencion(transcripcion)
+    if intencion != "chat":
+        fake_update = update
+        fake_update.message.text = transcripcion
+        await handle_message(fake_update, context)
+    else:
+        await responder_con_claude(
+            update, context,
+            messages_payload=[{"role": "user", "content": transcripcion}],
+            texto_para_historial=f"[Audio] {transcripcion}"
+        )
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
