@@ -49,7 +49,6 @@ ultimo_diario_escrito = None
 # ─────────────────────────────────────────
 
 async def gemini_request(prompt: str, max_tokens: int = 300, temperature: float = 0.5) -> str:
-    """Llamada base a Gemini. Rápida y barata para tareas de segundo plano."""
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
@@ -65,7 +64,6 @@ async def gemini_request(prompt: str, max_tokens: int = 300, temperature: float 
 
 
 async def gemini_consejero(respuesta_claude: str) -> str:
-    """Gemini revisa la respuesta de Claude y agrega solo si tiene algo concreto."""
     prompt = f"""Eres un consejero experto en negocios, video y estrategia digital.
 
 Respuesta de Cortana:
@@ -75,7 +73,6 @@ Criterios estrictos:
 - Solo habla si puedes agregar algo CONCRETO que Cortana NO menciono.
 - Si no, responde exactamente: [SILENCIO]
 - Si tienes algo, UN parrafo completo y directo. Nunca incompleto."""
-
     texto = await gemini_request(prompt, max_tokens=200)
     if not texto or "[SILENCIO]" in texto or len(texto) < 20:
         return ""
@@ -86,34 +83,26 @@ Criterios estrictos:
 
 
 async def gemini_extraer_recuerdos(user_text: str, respuesta: str):
-    """
-    Gemini extrae y categoriza lo relevante de cada conversacion.
-    Corre en segundo plano — no bloquea la respuesta.
-    Categorias: PROYECTO, PREFERENCIA, RELACION, FINANZA, DECISION
-    """
     if len(user_text) < 30:
         return
+    prompt = f"""Analiza esta conversacion con Diego y detecta informacion estrategica.
 
-    prompt = f"""Analiza esta conversacion con Diego y detecta informacion estrategica para su vida y su estudio Eclipse Estudio.
-
-Clasifica en estas categorias:
+Clasifica en:
 - PROYECTO: status, avances, problemas con clientes o trabajos
-- PREFERENCIA: como le gusta trabajar, que equipos usa, gustos personales
-- RELACION: datos sobre clientes, contactos, personas importantes
-- FINANZA: gastos, ingresos, deudas, inversiones GBM
-- DECISION: decisiones importantes que tomo
+- PREFERENCIA: como le gusta trabajar, equipos, gustos
+- RELACION: datos sobre clientes, contactos, personas
+- FINANZA: gastos, ingresos, deudas, inversiones
+- DECISION: decisiones importantes
 
 Diego dijo: {user_text[:300]}
 Cortana respondio: {respuesta[:300]}
 
-Responde en formato: [CATEGORIA] hecho concreto en una linea.
-Maximo 3 hechos. Solo lo realmente importante.
-Si no hay nada vital, responde: [NADA]"""
+Formato: [CATEGORIA] hecho concreto en una linea.
+Maximo 3 hechos. Si no hay nada vital: [NADA]"""
 
     resultado = await gemini_request(prompt, max_tokens=200, temperature=0.3)
     if not resultado or "[NADA]" in resultado:
         return
-
     for linea in resultado.split('\n'):
         linea = linea.strip()
         if not linea or len(linea) < 15:
@@ -126,64 +115,24 @@ Si no hay nada vital, responde: [NADA]"""
                 break
 
 
-async def gemini_validar_intencion(user_text: str, intencion_detectada: str) -> str:
-    """
-    Gemini valida si la intencion detectada es correcta.
-    Solo corre cuando hay ambiguedad — no en cada mensaje.
-    """
-    if intencion_detectada != "chat":
-        return intencion_detectada  # Si ya detectamos algo especifico, confiar
-
-    prompt = f"""Analiza este mensaje y determina si el usuario quiere hacer una accion especifica.
-
-Mensaje: {user_text}
-
-Responde SOLO con una de estas opciones:
-- chat (conversacion normal)
-- sheets (registrar gasto o ingreso)
-- leer_mail (ver correos)
-- redactar_mail (escribir correo)
-- calendar (agenda o eventos)
-- docs (crear documento)
-- drive (archivos)
-
-Solo una palabra."""
-
-    resultado = await gemini_request(prompt, max_tokens=20, temperature=0.1)
-    opciones_validas = ["chat", "sheets", "leer_mail", "redactar_mail", "calendar", "docs", "drive"]
-    resultado_limpio = resultado.strip().lower().replace(".", "")
-    return resultado_limpio if resultado_limpio in opciones_validas else intencion_detectada
-
-
 async def gemini_respaldo(system: str, user_text: str, historial: list) -> str:
-    """
-    Respaldo cuando Claude falla. Gemini responde como Cortana.
-    Transparente — Diego no sabe que cambio de cerebro.
-    """
     historial_str = ""
     for msg in historial[-5:]:
         quien = "Diego" if msg["role"] == "user" else "Cortana"
         historial_str += f"{quien}: {msg['content'][:100]}\n"
-
     prompt = f"""Eres Cortana, la IA personal de Diego Olguin. Responde exactamente como ella.
-
-Tu personalidad: fria, directa, leal, sin relleno. Siempre en espanol.
+Personalidad: fria, directa, leal, sin relleno. Siempre en espanol.
 
 Contexto reciente:
 {historial_str}
 
-Diego dice ahora: {user_text}
+Diego dice: {user_text}
 
-Responde como Cortana. Sin presentarte, sin explicar nada. Solo responde."""
-
+Responde como Cortana. Sin presentarte."""
     return await gemini_request(prompt, max_tokens=600, temperature=0.7)
 
 
 async def gemini_reflexion_nocturna():
-    """
-    Gemini procesa el dia completo y extrae pendientes y aprendizajes.
-    Se ejecuta junto con el diario nocturno.
-    """
     import psycopg2
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
@@ -195,32 +144,27 @@ async def gemini_reflexion_nocturna():
     rows = cur.fetchall()
     cur.close()
     conn.close()
-
     if not rows or len(rows) < 4:
         return
-
     historial_str = "\n".join([f"{'Diego' if r[0]=='user' else 'Cortana'}: {r[1][:150]}" for r in rows])
-
     prompt = f"""Analiza las conversaciones de hoy entre Diego y Cortana. Extrae:
 
-1. PENDIENTES: cosas que quedaron sin resolver o prometidas
-2. APRENDIZAJES: algo nuevo que Diego menciono sobre sus proyectos o vida
-3. ALERTAS: algo urgente que Diego deberia atender manana
+1. PENDIENTES: cosas sin resolver
+2. APRENDIZAJES: algo nuevo sobre proyectos o vida
+3. ALERTAS: algo urgente para manana
 
-Conversaciones de hoy:
+Conversaciones:
 {historial_str[:2000]}
 
-Responde en formato:
-PENDIENTE: [descripcion]
-APRENDIZAJE: [descripcion]
-ALERTA: [descripcion]
+Formato:
+PENDIENTE: descripcion
+APRENDIZAJE: descripcion
+ALERTA: descripcion
 
-Solo los realmente importantes. Si no hay nada, responde [NADA]."""
-
+Si no hay nada: [NADA]"""
     resultado = await gemini_request(prompt, max_tokens=400, temperature=0.3)
     if not resultado or "[NADA]" in resultado:
         return
-
     for linea in resultado.split('\n'):
         linea = linea.strip()
         for tipo in ["PENDIENTE", "APRENDIZAJE", "ALERTA"]:
@@ -237,7 +181,8 @@ Solo los realmente importantes. Si no hay nada, responde [NADA]."""
 
 async def check_diario(context):
     global ultimo_diario_escrito
-    ahora = datetime.utcnow()
+    from datetime import timezone
+    ahora = datetime.now(timezone.utc)
     hoy = date.today()
     if ahora.hour == HORA_DIARIO_UTC and ultimo_diario_escrito != hoy:
         try:
@@ -245,7 +190,6 @@ async def check_diario(context):
             escribir_entrada_diario()
             await gemini_reflexion_nocturna()
             ultimo_diario_escrito = hoy
-            logging.info("Diario y reflexion completados.")
         except Exception as e:
             logging.error(f"Error diario nocturno: {e}")
 
@@ -354,7 +298,6 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
             respuesta_claude = "Algo fallo. Intenta de nuevo."
 
     respuesta_final = respuesta_claude
-
     if usar_consejero:
         adicion = await gemini_consejero(respuesta_claude)
         if adicion:
@@ -362,10 +305,7 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
 
     guardar_mensaje("user", texto_para_historial)
     guardar_mensaje("assistant", respuesta_claude)
-
-    # Extraccion categorizada en segundo plano — no bloquea
     asyncio.create_task(gemini_extraer_recuerdos(texto_para_historial, respuesta_claude))
-
     await update.message.reply_text(respuesta_final)
 
 
@@ -376,7 +316,6 @@ async def responder_con_claude(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_sheets(update: Update, context, user_text: str):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
     hoy = datetime.now().strftime("%d/%m/%Y")
     categorias_str = ", ".join(CATEGORIAS_VALIDAS)
 
@@ -581,7 +520,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif any(p in texto_lower for p in ["nu", "nubank"]): metodo = "Nu"
             elif any(p in texto_lower for p in ["tarjeta", "credito", "debito"]): metodo = "Tarjeta"
             elif any(p in texto_lower for p in ["transferencia", "spei"]): metodo = "Transferencia"
-
             if metodo:
                 datos["metodo"] = metodo
                 guardar_config("egreso_pendiente", "")
@@ -658,7 +596,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Borrador actualizado:\n\n{email_draft[chat_id]['body']}\n\nDime 'envialo'.")
             return
 
-    # Detectar intencion
     intencion = detectar_intencion(user_text)
 
     if intencion == "leer_mail":
@@ -847,6 +784,45 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await responder_con_claude(update, context, [{"role": "user", "content": contenido}], f"[Video circular] {descripcion}")
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.mime_type or "pdf" not in doc.mime_type:
+        await update.message.reply_text("Solo puedo leer PDFs por ahora.")
+        return
+    if doc.file_size and doc.file_size > 15 * 1024 * 1024:
+        await update.message.reply_text("El PDF es muy pesado. Menos de 15MB.")
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await update.message.reply_text("Leyendo PDF...")
+
+    file = await context.bot.get_file(doc.file_id)
+    pdf_bytes = bytes(await file.download_as_bytearray())
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    caption = update.message.caption or "Analiza este documento y dime lo mas relevante para mi."
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                {"text": f"Analiza este PDF. Extrae los puntos mas importantes, fechas clave, montos, nombres y cualquier dato relevante. Responde en espanol.\n\nContexto adicional: {caption}"}
+            ]}],
+            "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.3}
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, json=payload)
+            analisis = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        guardar_recuerdo(f"[PDF: {doc.file_name}] {analisis[:500]}", "documento")
+        contexto = f"[PDF ANALIZADO: {doc.file_name}]\n\n{analisis}\n\nMensaje de Diego: {caption}"
+        await responder_con_claude(update, context, [{"role": "user", "content": contexto}], f"[PDF] {doc.file_name}", usar_consejero=False)
+
+    except Exception as e:
+        logging.error(f"Error PDF: {e}")
+        await update.message.reply_text(f"No pude leer el PDF: {e}")
+
+
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
@@ -870,7 +846,8 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Cortana en linea - Claude + Gemini dual brain activos...")
+    print("Cortana en linea - Claude + Gemini + PDF activos...")
     app.run_polling()
